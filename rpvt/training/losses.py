@@ -1,0 +1,37 @@
+"""Loss functions for local and global backprop training."""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def local_logit_lens_loss(hidden_states, labels, logit_lens, vocab_size):
+    """Compute local loss using logit lens projection.
+
+    This is the simplified L_usefulness for Experiment 1:
+    L = cross_entropy(logit_lens(hidden_states), next_token_target)
+
+    Args:
+        hidden_states: (batch, seq_len, hidden_size) — residual stream at the adapted layer.
+        labels: (batch, seq_len) — target token IDs (shifted by 1 from input).
+        logit_lens: LogitLens module for this layer.
+        vocab_size: Vocabulary size.
+
+    Returns:
+        Scalar loss.
+    """
+    logits = logit_lens(hidden_states)
+    return F.cross_entropy(logits.reshape(-1, vocab_size), labels.reshape(-1))
+
+
+def global_loss(logits, labels, vocab_size):
+    """Standard next-token prediction loss through the full model.
+
+    Args:
+        logits: (batch, seq_len, vocab_size) — model output logits.
+        labels: (batch, seq_len) — target token IDs.
+
+    Returns:
+        Scalar loss.
+    """
+    return F.cross_entropy(logits.reshape(-1, vocab_size), labels.reshape(-1))
