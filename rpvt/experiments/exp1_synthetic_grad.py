@@ -267,6 +267,44 @@ def train_with_synthetic_gradients(
                 loss = global_loss(logits, labels, vocab_size)
             print(f"    [synth] step {step}/{num_steps}, model_loss={loss.item():.4f}")
 
+        # Staleness check: periodically compare synthetic vs real gradient
+        if step % (log_every * 5) == 0:
+            # Run one step of real backprop to get the true gradient
+            real_captured = {}
+            real_grad = {}
+
+            def real_fwd(module, input, output):
+                out = output[0] if isinstance(output, tuple) else output
+                out.retain_grad()
+                real_captured["h"] = out
+
+            def real_bwd(module, grad_input, grad_output):
+                real_grad["g"] = grad_output[0].detach()
+
+            fh = layer.register_forward_hook(real_fwd)
+            bh = layer.register_full_backward_hook(real_bwd)
+
+            logits = model(input_ids).logits[:, :-1]
+            labels = input_ids[:, 1:]
+            real_loss = global_loss(logits, labels, vocab_size)
+            real_loss.backward()
+
+            fh.remove()
+            bh.remove()
+
+            if "h" in real_captured and "g" in real_grad:
+                with torch.no_grad():
+                    h_check = real_captured["h"].float()
+                    g_real = real_grad["g"].float()
+                    g_synth = predictor(h_check)
+                    cos = F.cosine_similarity(
+                        g_synth.reshape(-1), g_real.reshape(-1), dim=0
+                    ).item()
+                print(f"    [staleness] step {step}, cos_sim(synth, real)={cos:.4f}")
+
+            # Zero grads from the staleness check
+            optimizer.zero_grad()
+
     return
 
 
@@ -372,22 +410,58 @@ def main():
     )
     results["predictor_final_loss"] = pred_loss
 
-    # Check gradient prediction quality
+    # Check gradient prediction quality — full distribution
     print("\n  Gradient prediction quality check:")
     with torch.no_grad():
         norms_real = []
         norms_pred = []
         cos_sims = []
-        for h, g in gradient_data[:100]:
+        # Per-token cosine sims (not just per-sample)
+        cos_sims_per_token = []
+        for h, g in gradient_data:
             h, g = h.to(device), g.to(device)
             pred = predictor(h)
+            # Per-sample cosine sim
             cos = F.cosine_similarity(pred.reshape(-1), g.reshape(-1), dim=0)
             cos_sims.append(cos.item())
+            # Per-token cosine sims
+            for t in range(h.shape[0]):
+                cos_t = F.cosine_similarity(pred[t:t+1], g[t:t+1], dim=-1)
+                cos_sims_per_token.append(cos_t.item())
             norms_real.append(g.norm().item())
             norms_pred.append(pred.norm().item())
-        print(f"  Avg cosine similarity: {sum(cos_sims)/len(cos_sims):.4f}")
-        print(f"  Avg real grad norm:    {sum(norms_real)/len(norms_real):.6f}")
-        print(f"  Avg pred grad norm:    {sum(norms_pred)/len(norms_pred):.6f}")
+
+        cos_tensor = torch.tensor(cos_sims)
+        cos_token_tensor = torch.tensor(cos_sims_per_token)
+        pct_negative = (cos_tensor < 0).float().mean().item() * 100
+        pct_negative_token = (cos_token_tensor < 0).float().mean().item() * 100
+
+        print(f"  Per-sample cosine similarity (n={len(cos_sims)}):")
+        print(f"    mean:  {cos_tensor.mean().item():.4f}")
+        print(f"    std:   {cos_tensor.std().item():.4f}")
+        print(f"    min:   {cos_tensor.min().item():.4f}")
+        print(f"    max:   {cos_tensor.max().item():.4f}")
+        print(f"    % negative: {pct_negative:.1f}%")
+        print(f"  Per-token cosine similarity (n={len(cos_sims_per_token)}):")
+        print(f"    mean:  {cos_token_tensor.mean().item():.4f}")
+        print(f"    std:   {cos_token_tensor.std().item():.4f}")
+        print(f"    min:   {cos_token_tensor.min().item():.4f}")
+        print(f"    max:   {cos_token_tensor.max().item():.4f}")
+        print(f"    % negative: {pct_negative_token:.1f}%")
+        print(f"  Grad norms — real: {sum(norms_real)/len(norms_real):.6f}, pred: {sum(norms_pred)/len(norms_pred):.6f}")
+
+        results["cos_sim_distribution"] = {
+            "per_sample_mean": cos_tensor.mean().item(),
+            "per_sample_std": cos_tensor.std().item(),
+            "per_sample_min": cos_tensor.min().item(),
+            "per_sample_max": cos_tensor.max().item(),
+            "per_sample_pct_negative": pct_negative,
+            "per_token_mean": cos_token_tensor.mean().item(),
+            "per_token_std": cos_token_tensor.std().item(),
+            "per_token_min": cos_token_tensor.min().item(),
+            "per_token_max": cos_token_tensor.max().item(),
+            "per_token_pct_negative": pct_negative_token,
+        }
 
     torch.save(predictor.state_dict(), Path(args.output_dir) / "predictor.pt")
 
