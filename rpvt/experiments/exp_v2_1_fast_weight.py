@@ -207,11 +207,8 @@ def train_model(
     start_time = time.time()
 
     for epoch in range(num_epochs):
-        # Reset memories at start of each epoch
-        for layer in model.transformer.h:
-            if isinstance(layer, TransformerLayerWithMemory):
-                layer.reset_memory()
-
+        # No memory reset between sequences — M accumulates across the epoch.
+        # The decay naturally manages capacity (old writes fade).
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             outputs = model(input_ids, labels=input_ids)
@@ -270,10 +267,6 @@ def train_model(
                 if val_loss < best_val:
                     best_val = val_loss
                 model.train()
-                # Reset memories after eval
-                for layer in model.transformer.h:
-                    if isinstance(layer, TransformerLayerWithMemory):
-                        layer.reset_memory()
 
     final_val = evaluate(model, val_loader, device)
     print(f"  [{model_name}] Final val_loss={final_val:.4f}")
