@@ -332,13 +332,49 @@ def run_ablation_and_summary(model, val_loader, device, results, output_dir):
     else:
         print(f"  Model is NOT using the memory.")
 
-    results["ablation"] = {
+    results["ablation_w_out"] = {
         "loss_with_memory": loss_with,
         "loss_without_memory": loss_without,
         "memory_contribution": memory_contribution,
     }
 
-    # ── Final gate values ──
+    # ── Ablation 2: Reset M but keep W_out ──
+    # Tests whether model uses M's accumulated content or just the projections
+    print(f"\n{'='*60}")
+    print("ABLATION 2: Reset M to zero (keep W_out intact)")
+    print(f"{'='*60}")
+
+    # Save M states
+    original_Ms = {}
+    for i, layer in enumerate(model.transformer.h):
+        if isinstance(layer, TransformerLayerWithMemory):
+            original_Ms[i] = layer.memory.M.clone()
+            layer.memory.M.zero_()
+
+    loss_no_M = evaluate(model, val_loader, device)
+
+    # Restore M states
+    for i, M in original_Ms.items():
+        model.transformer.h[i].memory.M = M
+
+    M_contribution = loss_no_M - loss_with
+    print(f"  With M content:    {loss_with:.4f}")
+    print(f"  With M zeroed:     {loss_no_M:.4f}")
+    print(f"  M content contribution: {M_contribution:+.4f}")
+    if M_contribution > 0.01:
+        print(f"  Model IS using M's stored associations.")
+    elif M_contribution > 0:
+        print(f"  Model uses M content minimally.")
+    else:
+        print(f"  Model is NOT using M content — just using projections as extra compute.")
+
+    results["ablation_M_content"] = {
+        "loss_with_M": loss_with,
+        "loss_M_zeroed": loss_no_M,
+        "M_content_contribution": M_contribution,
+    }
+
+    # ── Final W_out norms ──
     print(f"\n{'='*60}")
     print("W_OUT NORMS (memory contribution scale per layer)")
     print(f"{'='*60}")
