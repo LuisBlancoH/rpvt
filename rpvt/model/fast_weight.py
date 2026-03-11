@@ -57,14 +57,20 @@ class FastWeightMemory(nn.Module):
         """Reset memory to zero."""
         self.M.zero_()
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process a sequence, updating memory token by token.
+    def forward(self, x: torch.Tensor, chunk_size: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process a sequence in chunks, updating memory between chunks.
+
+        Within each chunk, all tokens read from the same M state (beginning of chunk).
+        After the chunk, M is updated with all writes from that chunk.
+        This is a close approximation to token-by-token processing but much faster
+        (seq_len/chunk_size iterations instead of seq_len).
 
         Args:
             x: (batch, seq_len, hidden_size)
+            chunk_size: Number of tokens to process at once.
 
         Returns:
-            retrieved: (batch, seq_len, hidden_size) — memory output for each token
+            output: (batch, seq_len, hidden_size) — gated memory output
             gate_value: scalar gate value (for logging)
         """
         batch, seq_len, _ = x.shape
@@ -73,28 +79,30 @@ class FastWeightMemory(nn.Module):
         key = self.W_key(x)       # (batch, seq_len, memory_size)
         value = self.W_value(x)   # (batch, seq_len, memory_size)
 
-        # Process token by token (memory is recurrent)
-        retrieved_list = []
+        retrieved_chunks = []
         M = self.M.clone()  # (memory_size, memory_size)
 
-        for t in range(seq_len):
-            # Read: retrieve from current memory
-            q_t = query[:, t, :]  # (batch, memory_size)
-            r_t = torch.matmul(q_t, M.T)  # (batch, memory_size)
-            retrieved_list.append(r_t)
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            c_len = chunk_end - chunk_start
 
-            # Write: update memory with mean over batch
-            k_t = key[:, t, :]    # (batch, memory_size)
-            v_t = value[:, t, :]  # (batch, memory_size)
+            # Read: all tokens in this chunk read from current M
+            q_chunk = query[:, chunk_start:chunk_end, :]   # (batch, c_len, memory_size)
+            r_chunk = torch.matmul(q_chunk, M.T)           # (batch, c_len, memory_size)
+            retrieved_chunks.append(r_chunk)
 
-            # Outer product, averaged over batch
-            outer = torch.einsum("bi,bj->ij", v_t, k_t) / batch
-            M = self.decay * M + outer
+            # Write: accumulate all outer products from this chunk
+            k_chunk = key[:, chunk_start:chunk_end, :]     # (batch, c_len, memory_size)
+            v_chunk = value[:, chunk_start:chunk_end, :]   # (batch, c_len, memory_size)
+
+            # Sum of outer products, averaged over batch
+            chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / batch
+            M = (self.decay ** c_len) * M + chunk_outer
 
         # Store updated memory (detach — no gradient through memory across calls)
         self.M = M.detach()
 
-        retrieved = torch.stack(retrieved_list, dim=1)  # (batch, seq_len, memory_size)
+        retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
         gate_value = torch.sigmoid(self.gate)
