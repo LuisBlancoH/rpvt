@@ -33,11 +33,13 @@ class FastWeightMemory(nn.Module):
         hidden_size: int,
         memory_size: int = 256,
         decay: float = 0.99,
+        use_write_gate: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.memory_size = memory_size
         self.decay = decay
+        self.use_write_gate = use_write_gate
 
         # Projections: hidden_size -> memory_size
         self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
@@ -49,6 +51,13 @@ class FastWeightMemory(nn.Module):
         # and the model learns to use it through W_out weights directly.
         self.W_out = nn.Linear(memory_size, hidden_size, bias=False)
         nn.init.zeros_(self.W_out.weight)
+
+        # Write gate: learns which tokens are worth writing to M
+        if use_write_gate:
+            self.W_gate = nn.Linear(hidden_size, 1, bias=True)
+            # Initialize bias negative so gate starts mostly closed
+            nn.init.zeros_(self.W_gate.weight)
+            nn.init.constant_(self.W_gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
 
         # Memory matrix — not a parameter, not saved, starts at zero
         self.register_buffer("M", torch.zeros(memory_size, memory_size))
@@ -83,6 +92,12 @@ class FastWeightMemory(nn.Module):
         key = torch.nn.functional.normalize(key, dim=-1)
         value = torch.nn.functional.normalize(value, dim=-1)
 
+        # Compute write gate if enabled
+        if self.use_write_gate:
+            write_strength = torch.sigmoid(self.W_gate(x))  # (batch, seq_len, 1)
+        else:
+            write_strength = None
+
         retrieved_chunks = []
         M = self.M.clone()  # (memory_size, memory_size)
 
@@ -95,9 +110,15 @@ class FastWeightMemory(nn.Module):
             r_chunk = torch.matmul(q_chunk, M.T)           # (batch, c_len, memory_size)
             retrieved_chunks.append(r_chunk)
 
-            # Write: mean outer product over batch and chunk tokens
+            # Write: outer products weighted by write gate
             k_chunk = key[:, chunk_start:chunk_end, :]     # (batch, c_len, memory_size)
             v_chunk = value[:, chunk_start:chunk_end, :]   # (batch, c_len, memory_size)
+
+            if write_strength is not None:
+                # Scale each token's key/value by its write strength
+                ws_chunk = write_strength[:, chunk_start:chunk_end, :]  # (batch, c_len, 1)
+                k_chunk = k_chunk * ws_chunk
+                v_chunk = v_chunk * ws_chunk
 
             chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
             M = (self.decay ** c_len) * M + chunk_outer
@@ -108,8 +129,9 @@ class FastWeightMemory(nn.Module):
         retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
-        # No gate — W_out controls contribution scale directly
-        return output, None
+        # Return mean write strength for logging (None if no gate)
+        mean_ws = write_strength.mean().item() if write_strength is not None else None
+        return output, mean_ws
 
 
 class TransformerLayerWithMemory(nn.Module):
@@ -122,13 +144,15 @@ class TransformerLayerWithMemory(nn.Module):
         4. Write to fast weight memory
     """
 
-    def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256, decay: float = 0.99):
+    def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
+                 decay: float = 0.99, use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
         self.memory = FastWeightMemory(
             hidden_size=hidden_size,
             memory_size=memory_size,
             decay=decay,
+            use_write_gate=use_write_gate,
         )
 
     def forward(self, *args, **kwargs):
@@ -158,7 +182,8 @@ class TransformerLayerWithMemory(nn.Module):
         self.memory.reset_memory()
 
 
-def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99):
+def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
+                              use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -182,6 +207,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             hidden_size=hidden_size,
             memory_size=memory_size,
             decay=decay,
+            use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model
         device = next(original_layer.parameters()).device

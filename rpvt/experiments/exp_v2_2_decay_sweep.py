@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--max-docs", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--write-gate", action="store_true",
+                        help="Enable learned write gating")
     parser.add_argument("--output-dir", default="results/exp_v2_2_sweep")
     args = parser.parse_args()
 
@@ -83,8 +85,9 @@ def main():
     all_results = {"baseline": baseline_loss, "decays": {}}
 
     for decay in args.decays:
+        gate_str = " + write gate" if args.write_gate else ""
         print(f"\n{'='*60}")
-        print(f"DECAY = {decay}")
+        print(f"DECAY = {decay}{gate_str}")
         print(f"{'='*60}")
 
         # Build fresh model with this decay
@@ -97,6 +100,7 @@ def main():
             hidden_size=model.config.n_embd,
             memory_size=args.memory_size,
             decay=decay,
+            use_write_gate=args.write_gate,
         )
 
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
