@@ -45,11 +45,10 @@ class FastWeightMemory(nn.Module):
         self.W_value = nn.Linear(hidden_size, memory_size, bias=False)
 
         # Output projection: memory_size -> hidden_size
+        # Zero-initialized so memory starts with no contribution,
+        # and the model learns to use it through W_out weights directly.
         self.W_out = nn.Linear(memory_size, hidden_size, bias=False)
-
-        # Learnable gate — initialized small but with enough gradient flow
-        # sigmoid(-2) ≈ 0.12: small contribution, but gradients can still flow
-        self.gate = nn.Parameter(torch.full((1,), -2.0))
+        nn.init.zeros_(self.W_out.weight)
 
         # Memory matrix — not a parameter, not saved, starts at zero
         self.register_buffer("M", torch.zeros(memory_size, memory_size))
@@ -109,8 +108,8 @@ class FastWeightMemory(nn.Module):
         retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
-        gate_value = torch.sigmoid(self.gate)
-        return output * gate_value, gate_value
+        # No gate — W_out controls contribution scale directly
+        return output, None
 
 
 class TransformerLayerWithMemory(nn.Module):

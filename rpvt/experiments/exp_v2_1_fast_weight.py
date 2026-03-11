@@ -171,12 +171,12 @@ def evaluate(model, val_loader, device, max_batches=100):
 
 
 def get_gate_values(model):
-    """Get gate values from all memory layers."""
+    """Get W_out norm from all memory layers (measures memory contribution scale)."""
     gates = {}
     for i, layer in enumerate(model.transformer.h):
         if isinstance(layer, TransformerLayerWithMemory):
-            gate_val = torch.sigmoid(layer.memory.gate).item()
-            gates[f"layer_{i}"] = gate_val
+            w_out_norm = layer.memory.W_out.weight.norm().item()
+            gates[f"layer_{i}"] = w_out_norm
     return gates
 
 
@@ -267,7 +267,7 @@ def train_model(
 
                 log_data.append(log_entry)
 
-                gate_str = f", gate={log_entry.get('mean_gate', 0):.4f}" if gates else ""
+                gate_str = f", W_out={log_entry.get('mean_gate', 0):.4f}" if gates else ""
                 norm_str = f", M_norm={log_entry.get('mean_memory_norm', 0):.1f}" if norms else ""
                 print(
                     f"  [{model_name}] step {global_step}/{total_steps}, "
@@ -296,18 +296,18 @@ def memory_ablation(model, val_loader, device):
     # Eval with memory (normal)
     loss_with = evaluate(model, val_loader, device)
 
-    # Zero out all memory gates
-    original_gates = {}
+    # Zero out W_out weights to disable memory contribution
+    original_weights = {}
     for i, layer in enumerate(model.transformer.h):
         if isinstance(layer, TransformerLayerWithMemory):
-            original_gates[i] = layer.memory.gate.data.clone()
-            layer.memory.gate.data.fill_(-100.0)  # sigmoid(-100) ~ 0
+            original_weights[i] = layer.memory.W_out.weight.data.clone()
+            layer.memory.W_out.weight.data.zero_()
 
     loss_without = evaluate(model, val_loader, device)
 
-    # Restore gates
-    for i, gate_val in original_gates.items():
-        model.transformer.h[i].memory.gate.data = gate_val
+    # Restore W_out weights
+    for i, w in original_weights.items():
+        model.transformer.h[i].memory.W_out.weight.data = w
 
     return loss_with, loss_without
 
@@ -340,7 +340,7 @@ def run_ablation_and_summary(model, val_loader, device, results, output_dir):
 
     # ── Final gate values ──
     print(f"\n{'='*60}")
-    print("GATE VALUES (sigmoid of learned gate parameter)")
+    print("W_OUT NORMS (memory contribution scale per layer)")
     print(f"{'='*60}")
     gates = get_gate_values(model)
     for layer, val in gates.items():
