@@ -67,6 +67,13 @@ class FastWeightMemory(nn.Module):
             retrieved: (batch, seq_len, hidden_size) — memory output for each token
             gate_value: scalar gate value (for logging)
         """
+        # Handle both 2D (seq_len, hidden) and 3D (batch, seq_len, hidden)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
         batch, seq_len, _ = x.shape
 
         query = self.W_query(x)   # (batch, seq_len, memory_size)
@@ -98,7 +105,10 @@ class FastWeightMemory(nn.Module):
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
         gate_value = torch.sigmoid(self.gate)
-        return output * gate_value, gate_value
+        output = output * gate_value
+        if squeeze_output:
+            output = output.squeeze(0)
+        return output, gate_value
 
 
 class TransformerLayerWithMemory(nn.Module):
