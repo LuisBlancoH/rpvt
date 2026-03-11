@@ -67,13 +67,6 @@ class FastWeightMemory(nn.Module):
             retrieved: (batch, seq_len, hidden_size) — memory output for each token
             gate_value: scalar gate value (for logging)
         """
-        # Handle both 2D (seq_len, hidden) and 3D (batch, seq_len, hidden)
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
         batch, seq_len, _ = x.shape
 
         query = self.W_query(x)   # (batch, seq_len, memory_size)
@@ -105,10 +98,7 @@ class FastWeightMemory(nn.Module):
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
         gate_value = torch.sigmoid(self.gate)
-        output = output * gate_value
-        if squeeze_output:
-            output = output.squeeze(0)
-        return output, gate_value
+        return output * gate_value, gate_value
 
 
 class TransformerLayerWithMemory(nn.Module):
@@ -135,8 +125,11 @@ class TransformerLayerWithMemory(nn.Module):
         # Run original transformer layer
         outputs = self.layer(*args, **kwargs)
 
-        # outputs is a tuple: (hidden_states, ...) for Qwen
-        hidden_states = outputs[0]
+        # Handle both tuple outputs (Qwen) and direct tensor outputs (GPT-2)
+        if isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
 
         # Read from and write to memory
         memory_output, gate_value = self.memory(hidden_states)
@@ -144,8 +137,11 @@ class TransformerLayerWithMemory(nn.Module):
         # Add memory output to hidden states
         modified = hidden_states + memory_output
 
-        # Return with modified hidden states, preserving other outputs
-        return (modified,) + outputs[1:]
+        # Return in same format as original layer
+        if isinstance(outputs, tuple):
+            return (modified,) + outputs[1:]
+        else:
+            return modified
 
     def reset_memory(self):
         self.memory.reset_memory()
