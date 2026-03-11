@@ -47,8 +47,9 @@ class FastWeightMemory(nn.Module):
         # Output projection: memory_size -> hidden_size
         self.W_out = nn.Linear(memory_size, hidden_size, bias=False)
 
-        # Learnable gate — initialized near zero so model must actively learn to use memory
-        self.gate = nn.Parameter(torch.full((1,), -5.0))
+        # Learnable gate — initialized small but with enough gradient flow
+        # sigmoid(-2) ≈ 0.12: small contribution, but gradients can still flow
+        self.gate = nn.Parameter(torch.full((1,), -2.0))
 
         # Memory matrix — not a parameter, not saved, starts at zero
         self.register_buffer("M", torch.zeros(memory_size, memory_size))
