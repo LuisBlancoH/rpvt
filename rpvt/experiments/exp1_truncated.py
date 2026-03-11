@@ -110,16 +110,17 @@ def forward_truncated(model, input_ids, adapter_layer_idx, grad_depth):
     # Embedding
     hidden = model.model.embed_tokens(input_ids)
 
-    # Create causal attention mask and position ids
+    # Position embeddings (Qwen2 uses rotary embeddings computed by the model)
     batch_size, seq_len = input_ids.shape
     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+    position_embeddings = model.model.rotary_emb(hidden, position_ids)
 
     # Run through layers
     for i, layer in enumerate(layers):
         if i == detach_after:
             hidden = hidden.detach().requires_grad_(True)
 
-        layer_out = layer(hidden, position_ids=position_ids)
+        layer_out = layer(hidden, position_ids=position_ids, position_embeddings=position_embeddings)
         hidden = layer_out[0]
 
     # Final norm + lm_head
