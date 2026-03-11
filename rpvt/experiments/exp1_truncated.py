@@ -76,56 +76,47 @@ def remove_adapter(model, layer_idx, target, original_linear):
     setattr(parent, attr_path[-1], original_linear)
 
 
+class _DetachHook:
+    """Pre-forward hook that detaches hidden states to truncate gradient flow."""
+
+    def __init__(self):
+        self.handle = None
+
+    def __call__(self, module, args, kwargs=None):
+        # args[0] is hidden_states for Qwen2 decoder layers
+        detached = args[0].detach().requires_grad_(True)
+        return (detached,) + args[1:], kwargs
+
+    def register(self, layer):
+        self.handle = layer.register_forward_pre_hook(self, with_kwargs=True)
+
+    def remove(self):
+        if self.handle:
+            self.handle.remove()
+            self.handle = None
+
+
 def forward_truncated(model, input_ids, adapter_layer_idx, grad_depth):
     """Forward pass with truncated gradient flow.
 
-    Runs the full model but detaches the residual stream at
-    (adapter_layer_idx + grad_depth), so gradients only flow
-    through `grad_depth` layers after the adapter.
-
-    If grad_depth covers all remaining layers, this is equivalent
-    to full global backprop.
-
-    Args:
-        model: The model.
-        input_ids: Input token IDs.
-        adapter_layer_idx: Layer where the adapter is.
-        grad_depth: Number of downstream layers to allow gradient flow through.
-            0 = detach right after adapter layer (local)
-            None = no detachment (full global)
-
-    Returns:
-        logits: Model output logits with appropriate gradient truncation.
+    Uses a pre-hook to detach the residual stream at the right layer,
+    so gradients only flow through `grad_depth` layers after the adapter.
     """
-    layers = get_layers(model)
-    num_layers = len(layers)
-
     if grad_depth is None:
-        # Full global backprop
         return model(input_ids).logits
 
-    # We need to manually run the forward pass to insert detach at the right point
-    detach_after = adapter_layer_idx + grad_depth
+    layers = get_layers(model)
+    num_layers = len(layers)
+    detach_at = adapter_layer_idx + grad_depth
 
-    # Embedding
-    hidden = model.model.embed_tokens(input_ids)
+    hook = _DetachHook()
+    if detach_at < num_layers:
+        hook.register(layers[detach_at])
 
-    # Position embeddings (Qwen2 uses rotary embeddings computed by the model)
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-    position_embeddings = model.model.rotary_emb(hidden, position_ids)
-
-    # Run through layers
-    for i, layer in enumerate(layers):
-        if i == detach_after:
-            hidden = hidden.detach().requires_grad_(True)
-
-        layer_out = layer(hidden, position_ids=position_ids, position_embeddings=position_embeddings)
-        hidden = layer_out[0]
-
-    # Final norm + lm_head
-    hidden = model.model.norm(hidden)
-    logits = model.lm_head(hidden)
+    try:
+        logits = model(input_ids).logits
+    finally:
+        hook.remove()
 
     return logits
 
