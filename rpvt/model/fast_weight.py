@@ -12,9 +12,11 @@ Memory update per token:
 Write modes:
     "uniform":  write_strength = 1 (all tokens write equally)
     "gate":     write_strength = sigmoid(W_gate @ hidden_state) (learned gate)
-    "surprise": write_strength = sigmoid(scale * ||error|| + bias)
-                where error = hidden_state - W_out(M @ query)
+    "surprise": write_strength = sigmoid(scale * z + bias)
+                where z = (||error|| - mean) / std (z-scored prediction error)
+                error = hidden_state - W_out(M @ query)
                 Surprise-driven: write strongly when M's prediction is wrong.
+                Running stats normalize errors so sigmoid inputs are always useful.
 
 Memory retrieval per token:
     query = W_query @ hidden_state
@@ -74,16 +76,17 @@ class FastWeightMemory(nn.Module):
         else:
             self.use_write_gate = write_mode == "gate"
 
-        # Surprise-driven write strength
+        # Surprise-driven write strength (z-score normalized)
         if write_mode == "surprise":
-            # Two learned scalars: how to map error magnitude to write strength
-            # sigmoid(scale * (||error|| / sqrt(hidden_size)) + bias)
-            # ||error|| / sqrt(hidden_size) ≈ 1.0 for typical hidden states
-            # So sigmoid(1.0 * 1.0 + (-2.0)) = sigmoid(-1.0) ≈ 0.27 baseline
-            # As W_out trains and predictions improve, errors shrink → writes decrease
-            self.surprise_scale = nn.Parameter(torch.tensor(1.0))
-            self.surprise_bias = nn.Parameter(torch.tensor(-2.0))
-            self.error_norm_scale = math.sqrt(hidden_size)  # not learned, just normalization
+            # Write strength = sigmoid(scale * z + bias)
+            # where z = (||error|| - chunk_mean) / (chunk_std + eps)
+            # z is computed per-chunk so tokens within the same chunk
+            # get different write strengths based on relative surprise.
+            #
+            # scale controls sensitivity: higher = more differentiation
+            # bias controls baseline: negative = write less on average
+            self.surprise_scale = 2.0   # hyperparameter, not learned
+            self.surprise_bias = -0.5   # sigmoid(-0.5) ≈ 0.38 at mean error
 
         # Memory matrix — not a parameter, not saved, starts at zero
         self.register_buffer("M", torch.zeros(memory_size, memory_size))
@@ -152,13 +155,21 @@ class FastWeightMemory(nn.Module):
                 actual = x[:, chunk_start:chunk_end, :]  # (batch, c_len, hidden_size)
                 error = actual - prediction
 
-                # Normalized error magnitude per token
-                # Divide by sqrt(hidden_size) so typical values are ~1.0
-                error_norm = error.norm(dim=-1, keepdim=True) / self.error_norm_scale
+                # Error magnitude per token
+                error_norm = error.norm(dim=-1, keepdim=True)  # (batch, c_len, 1)
 
-                # Map normalized error to write strength via learned scale + bias
+                # Z-score within this chunk: tokens compete on relative surprise
+                # Detach mean/std so gradients flow through error_norm only
+                chunk_mean = error_norm.mean().detach()
+                chunk_std = error_norm.std().detach().clamp(min=1e-6)
+                z = (error_norm - chunk_mean) / chunk_std
+
+                # Map z-score to write strength
+                # z=0 (average surprise) → sigmoid(-0.5) ≈ 0.38
+                # z=+1 (1 std above, surprising) → sigmoid(1.5) ≈ 0.82
+                # z=-1 (1 std below, expected) → sigmoid(-2.5) ≈ 0.08
                 ws_chunk = torch.sigmoid(
-                    self.surprise_scale * error_norm + self.surprise_bias
+                    self.surprise_scale * z + self.surprise_bias
                 )  # (batch, c_len, 1)
 
                 k_chunk = k_chunk * ws_chunk

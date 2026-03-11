@@ -127,12 +127,11 @@ def main():
             n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"  Trainable params: {n_trainable:,}")
 
-            # Show surprise-specific params
+            # Show surprise hyperparams
             if write_mode == "surprise":
-                for i, mem in enumerate(memory_modules):
-                    if i == 0:  # just show first layer
-                        print(f"  surprise_scale init: {mem.surprise_scale.item():.2f}")
-                        print(f"  surprise_bias init:  {mem.surprise_bias.item():.2f}")
+                mem = memory_modules[0]
+                print(f"  surprise_scale: {mem.surprise_scale:.1f}")
+                print(f"  surprise_bias:  {mem.surprise_bias:.1f}")
 
             # Train
             train_losses, log_data = train_sequential(
@@ -141,15 +140,6 @@ def main():
                 warmup_steps=200, log_every=args.log_every,
                 model_name=run_key,
             )
-
-            # Show final surprise params
-            if write_mode == "surprise":
-                scales = [m.surprise_scale.item() for m in memory_modules]
-                biases = [m.surprise_bias.item() for m in memory_modules]
-                print(f"\n  Final surprise_scale: {sum(scales)/len(scales):.4f} "
-                      f"(range: {min(scales):.4f} to {max(scales):.4f})")
-                print(f"  Final surprise_bias:  {sum(biases)/len(biases):.4f} "
-                      f"(range: {min(biases):.4f} to {max(biases):.4f})")
 
             # Evaluate by position
             print(f"\n  Evaluating by position...")

@@ -222,14 +222,7 @@ def get_write_mode_info(model):
                         values.append(torch.sigmoid(l.memory.W_gate.bias).item())
                 return "gate", sum(values) / len(values)
             elif mem.write_mode == "surprise":
-                scales, biases = [], []
-                for l in model.transformer.h:
-                    if isinstance(l, TransformerLayerWithMemory) and l.memory.write_mode == "surprise":
-                        scales.append(l.memory.surprise_scale.item())
-                        biases.append(l.memory.surprise_bias.item())
-                avg_scale = sum(scales) / len(scales)
-                avg_bias = sum(biases) / len(biases)
-                return "surprise", (avg_scale, avg_bias)
+                return "surprise", (mem.surprise_scale, mem.surprise_bias)
             else:
                 return "uniform", None
     return None, None
@@ -320,7 +313,7 @@ def train_sequential(
                 if wm_mode == "gate":
                     extra = f", gate={wm_val:.4f}"
                 elif wm_mode == "surprise":
-                    extra = f", s_scale={wm_val[0]:.2f}, s_bias={wm_val[1]:.2f}"
+                    extra = f", s={wm_val[0]:.1f}, b={wm_val[1]:.1f}"
                 else:
                     extra = ""
                 print(
