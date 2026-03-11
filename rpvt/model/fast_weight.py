@@ -43,6 +43,7 @@ class FastWeightMemory(nn.Module):
         memory_size: int = 256,
         decay: float = 0.99,
         write_mode: str = "uniform",
+        max_m_norm: float = 10.0,
         # Legacy compat
         use_write_gate: bool = False,
     ):
@@ -50,6 +51,7 @@ class FastWeightMemory(nn.Module):
         self.hidden_size = hidden_size
         self.memory_size = memory_size
         self.decay = decay
+        self.max_m_norm = max_m_norm
 
         # Handle legacy use_write_gate parameter
         if use_write_gate and write_mode == "uniform":
@@ -180,6 +182,12 @@ class FastWeightMemory(nn.Module):
             chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
             M = (self.decay ** c_len) * M + chunk_outer
 
+            # Cap M norm to prevent explosion at slow decay rates
+            if self.max_m_norm > 0:
+                m_norm = M.norm()
+                if m_norm > self.max_m_norm:
+                    M = M * (self.max_m_norm / m_norm)
+
         # Store updated memory (detach — no gradient through memory across calls)
         self.M = M.detach()
 
@@ -201,7 +209,8 @@ class TransformerLayerWithMemory(nn.Module):
     """
 
     def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
-                 decay: float = 0.99, write_mode: str = "uniform", use_write_gate: bool = False):
+                 decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
+                 use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
         self.memory = FastWeightMemory(
@@ -209,6 +218,7 @@ class TransformerLayerWithMemory(nn.Module):
             memory_size=memory_size,
             decay=decay,
             write_mode=write_mode,
+            max_m_norm=max_m_norm,
             use_write_gate=use_write_gate,
         )
 
@@ -240,7 +250,7 @@ class TransformerLayerWithMemory(nn.Module):
 
 
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
-                              write_mode="uniform", use_write_gate=False):
+                              write_mode="uniform", max_m_norm=10.0, use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -250,6 +260,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
         memory_size: Dimension of key/value/query projections.
         decay: Memory decay rate per token.
         write_mode: "uniform", "gate", or "surprise".
+        max_m_norm: Cap on M's Frobenius norm. 0 = no cap.
 
     Returns:
         List of FastWeightMemory modules (for parameter access).
@@ -266,6 +277,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             memory_size=memory_size,
             decay=decay,
             write_mode=write_mode,
+            max_m_norm=max_m_norm,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model

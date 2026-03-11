@@ -58,6 +58,8 @@ def main():
                         default=["uniform", "surprise"],
                         choices=["uniform", "gate", "surprise"],
                         help="Write modes to compare")
+    parser.add_argument("--max-m-norm", type=float, default=10.0,
+                        help="Cap on M's Frobenius norm (0 = no cap)")
     parser.add_argument("--lr", type=float, default=9e-4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -122,6 +124,7 @@ def main():
                 memory_size=args.memory_size,
                 decay=decay,
                 write_mode=write_mode,
+                max_m_norm=args.max_m_norm,
             )
 
             n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
