@@ -24,6 +24,30 @@ def local_logit_lens_loss(hidden_states, labels, logit_lens, vocab_size):
     return F.cross_entropy(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
 
+def native_logit_lens_loss(hidden_states, labels, model):
+    """Compute local loss using the model's own final norm + lm_head.
+
+    Instead of a separately trained projection, apply the model's actual
+    output pathway (RMSNorm + lm_head) to the intermediate residual stream.
+    This is the classic "logit lens" from interpretability and should be
+    better aligned with downstream computation.
+
+    Args:
+        hidden_states: (batch, seq_len, hidden_size) — residual stream at adapted layer.
+        labels: (batch, seq_len) — target token IDs.
+        model: The full model (need access to model.model.norm and model.lm_head).
+
+    Returns:
+        Scalar loss.
+    """
+    normed = model.model.norm(hidden_states)
+    logits = model.lm_head(normed)
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+    )
+
+
 def global_loss(logits, labels, vocab_size):
     """Standard next-token prediction loss through the full model.
 
