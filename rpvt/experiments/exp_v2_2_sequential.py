@@ -210,6 +210,20 @@ def get_wout_norms(model):
     return sum(norms) / len(norms) if norms else 0
 
 
+def get_mean_gate_value(model):
+    """Get mean write gate bias (proxy for gate openness). Returns None if no gate."""
+    values = []
+    for layer in model.transformer.h:
+        if isinstance(layer, TransformerLayerWithMemory):
+            mem = layer.memory
+            if mem.use_write_gate:
+                # Report sigmoid of gate bias as baseline openness
+                values.append(torch.sigmoid(mem.W_gate.bias).item())
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 def train_sequential(
     model, dataset, device,
     num_epochs=3, lr=9e-4, warmup_steps=200,
@@ -278,6 +292,7 @@ def train_sequential(
                 tokens_per_sec = (global_step * input_ids.shape[0] * input_ids.shape[1]) / elapsed
                 m_norm = get_memory_norms(model)
                 w_norm = get_wout_norms(model)
+                gate_val = get_mean_gate_value(model)
 
                 log_entry = {
                     "step": global_step,
@@ -286,12 +301,15 @@ def train_sequential(
                     "tokens_per_sec": tokens_per_sec,
                     "M_norm": m_norm,
                     "W_out_norm": w_norm,
+                    "gate": gate_val,
                 }
                 log_data.append(log_entry)
+                gate_str = f", gate={gate_val:.4f}" if gate_val is not None else ""
                 print(
                     f"  [{model_name}] step {global_step}/{total_steps}, "
                     f"loss={avg_loss:.4f}, lr={log_entry['lr']:.2e}, "
                     f"{tokens_per_sec:.0f} tok/s, W_out={w_norm:.2f}, M_norm={m_norm:.2f}"
+                    f"{gate_str}"
                 )
 
     return train_losses, log_data
