@@ -1,20 +1,18 @@
 """Experiment 1d: Truncated backprop — how many downstream layers are needed?
 
-We've established that truly local backprop (0 downstream layers) doesn't work.
-Global backprop (all downstream layers) works but is expensive.
+We've established that truly local backprop (0 downstream layers) doesn't work
+when using a projection-based loss. Global backprop works.
 
 This experiment finds the minimum number of downstream layers needed for
-useful gradient signal. If it's small (e.g., 3-5 layers), inference-time
-learning is still feasible — much cheaper than full backprop.
+useful gradient signal by computing a loss at different depths after the adapter:
 
-For adapter at layer L in an N-layer model:
-  - depth=0: local loss at layer L (broken, we know this)
-  - depth=3: loss at layer L+3, backprop through 3 frozen layers
-  - depth=N-L: full global loss (works, we know this)
+  depth=0: loss = CE(norm(lm_head(layer_20_output)), target)  [local, known broken]
+  depth=3: loss = CE(norm(lm_head(layer_23_output)), target)  [3 layers of backprop]
+  depth=full: loss = CE(model_output, target)                  [global, known working]
 
-We compute the loss at the final model output but only allow gradients
-to flow backward from a certain depth. Everything beyond that depth
-is detached.
+For each depth, we capture the hidden state at (adapter_layer + depth),
+project it to logits via the model's norm+lm_head, compute CE loss,
+and backprop through those depth layers to the adapter.
 """
 
 import argparse
@@ -35,6 +33,7 @@ from rpvt.model.base import (
     get_vocab_size,
 )
 from rpvt.model.adapter import attach_adapter
+from rpvt.model.hooks import ResidualStreamCapture
 from rpvt.training.data import TokenizedDataset
 from rpvt.training.losses import global_loss
 
@@ -76,58 +75,20 @@ def remove_adapter(model, layer_idx, target, original_linear):
     setattr(parent, attr_path[-1], original_linear)
 
 
-class _DetachHook:
-    """Pre-forward hook that detaches hidden states to truncate gradient flow."""
-
-    def __init__(self):
-        self.handle = None
-
-    def __call__(self, module, args, kwargs=None):
-        # args[0] is hidden_states for Qwen2 decoder layers
-        detached = args[0].detach().requires_grad_(True)
-        return (detached,) + args[1:], kwargs
-
-    def register(self, layer):
-        self.handle = layer.register_forward_pre_hook(self, with_kwargs=True)
-
-    def remove(self):
-        if self.handle:
-            self.handle.remove()
-            self.handle = None
-
-
-def forward_truncated(model, input_ids, adapter_layer_idx, grad_depth):
-    """Forward pass with truncated gradient flow.
-
-    Uses a pre-hook to detach the residual stream at the right layer,
-    so gradients only flow through `grad_depth` layers after the adapter.
-    """
-    if grad_depth is None:
-        return model(input_ids).logits
-
-    layers = get_layers(model)
-    num_layers = len(layers)
-    detach_at = adapter_layer_idx + grad_depth
-
-    hook = _DetachHook()
-    if detach_at < num_layers:
-        hook.register(layers[detach_at])
-
-    try:
-        logits = model(input_ids).logits
-    finally:
-        hook.remove()
-
-    return logits
-
-
 def train_and_eval(
     model, layer_idx, train_loader, eval_loader,
     vocab_size, device, num_steps, lr, target, rank,
     grad_depth=None, log_every=100,
 ):
+    """Train adapter with loss computed at a specific depth after the adapter.
+
+    grad_depth=None: full global backprop (loss at final model output)
+    grad_depth=N: capture hidden state N layers after adapter, project via
+                  norm+lm_head, backprop through those N layers to adapter.
+    """
     adapted = attach_adapter(model, layer_idx, target=target, rank=rank)
     original_linear = adapted.frozen
+    num_layers = get_num_layers(model)
 
     optimizer = torch.optim.Adam(adapted.adapter.parameters(), lr=lr)
     model.train()
@@ -139,9 +100,24 @@ def train_and_eval(
         input_ids = batch["input_ids"].to(device)
         labels = input_ids[:, 1:]
 
-        logits = forward_truncated(model, input_ids, layer_idx, grad_depth)
-        logits = logits[:, :-1]
-        loss = global_loss(logits, labels, vocab_size)
+        if grad_depth is None:
+            # Full global: use model's actual output
+            logits = model(input_ids).logits[:, :-1]
+            loss = global_loss(logits, labels, vocab_size)
+        else:
+            # Capture hidden state at (adapter_layer + depth)
+            capture_layer = min(layer_idx + grad_depth, num_layers - 1)
+            with ResidualStreamCapture(model, [capture_layer]) as cap:
+                model(input_ids)
+                hidden = cap.captured[capture_layer][:, :-1]
+
+            # Project to logits via model's own norm + lm_head
+            normed = model.model.norm(hidden)
+            logits = model.lm_head(normed)
+            loss = F.cross_entropy(
+                logits.reshape(-1, vocab_size),
+                labels.reshape(-1),
+            )
 
         optimizer.zero_grad()
         loss.backward()
@@ -161,7 +137,7 @@ def main():
     parser = argparse.ArgumentParser(description="Experiment 1d: truncated backprop depth")
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B")
     parser.add_argument("--layers", type=int, nargs="+", default=[20, 25, 30])
-    parser.add_argument("--depths", type=int, nargs="+", default=[0, 1, 2, 3, 5, 8])
+    parser.add_argument("--depths", type=int, nargs="+", default=[0, 1, 2, 3, 5, 8, 12])
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--target", default="mlp_out")
@@ -175,7 +151,6 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = args.device
     dtype = torch.bfloat16
-    num_layers_model = None
 
     print(f"Loading {args.model}...")
     model, tokenizer = load_base_model(args.model, device=device, dtype=dtype)
@@ -196,7 +171,7 @@ def main():
     results = {"baseline": baseline_loss, "num_layers": num_layers_model, "layers": {}}
 
     for layer_idx in args.layers:
-        max_possible_depth = num_layers_model - layer_idx
+        max_possible_depth = num_layers_model - 1 - layer_idx
         print(f"\n{'='*60}")
         print(f"LAYER {layer_idx} (max depth = {max_possible_depth})")
         print(f"{'='*60}")
@@ -223,7 +198,7 @@ def main():
         for depth in args.depths:
             if depth > max_possible_depth:
                 continue
-            print(f"  Depth={depth} (backprop through {depth} downstream layers)...")
+            print(f"  Depth={depth} (loss at layer {layer_idx + depth}, backprop through {depth} layers)...")
             eval_loss = train_and_eval(
                 model, layer_idx, train_loader, eval_loader,
                 vocab_size, device,
@@ -253,23 +228,23 @@ def main():
     all_depths = ["full"] + [str(d) for d in args.depths]
     print(f"{'Layer':>6} | ", end="")
     for d in all_depths:
-        print(f"{'depth='+d:>12} | ", end="")
+        print(f"{'d='+d:>8} | ", end="")
     print()
-    print("-" * (10 + 15 * len(all_depths)))
+    print("-" * (10 + 11 * len(all_depths)))
 
     for layer_idx in args.layers:
         lr_key = str(layer_idx)
         if lr_key not in results["layers"]:
             continue
         r = results["layers"][lr_key]
-        print(f"{layer_idx:>6} | {'100.0%':>12} | ", end="")
+        print(f"{layer_idx:>6} | {'100%':>8} | ", end="")
         for depth in args.depths:
             depth_r = r["depths"].get(str(depth), {})
             ratio = depth_r.get("ratio", None)
             if ratio is not None:
-                print(f"{ratio:>11.1%} | ", end="")
+                print(f"{ratio:>7.1%} | ", end="")
             else:
-                print(f"{'n/a':>12} | ", end="")
+                print(f"{'n/a':>8} | ", end="")
         print()
 
     print(f"\nResults saved to {args.output_dir}/results.json")
