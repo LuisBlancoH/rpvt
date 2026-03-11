@@ -69,3 +69,42 @@ class ResidualStreamCapture:
             hidden = output[0] if isinstance(output, tuple) else output
             self.captured[idx] = hidden
         return hook_fn
+
+
+class InputOutputCapture:
+    """Capture both the input and output of specified layers.
+
+    Captures:
+        inputs[idx]  = residual stream BEFORE the layer (for "without" baseline)
+        outputs[idx] = residual stream AFTER the layer (for "with" contribution)
+
+    Outputs are not detached (gradients flow). Inputs are detached (no grad needed).
+    """
+
+    def __init__(self, model, layer_indices):
+        self.model = model
+        self.layer_indices = layer_indices
+        self.inputs = {}
+        self.outputs = {}
+        self._hooks = []
+
+    def __enter__(self):
+        layers = get_layers(self.model)
+        for idx in self.layer_indices:
+            h = layers[idx].register_forward_hook(self._make_hook(idx))
+            self._hooks.append(h)
+        return self
+
+    def __exit__(self, *args):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def _make_hook(self, idx):
+        def hook_fn(module, input, output):
+            # input is a tuple; first element is the hidden states
+            inp = input[0] if isinstance(input, tuple) else input
+            self.inputs[idx] = inp.detach()
+            out = output[0] if isinstance(output, tuple) else output
+            self.outputs[idx] = out
+        return hook_fn
