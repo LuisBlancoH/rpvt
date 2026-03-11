@@ -157,14 +157,15 @@ class FastWeightMemory(nn.Module):
                 actual = x[:, chunk_start:chunk_end, :]  # (batch, c_len, hidden_size)
                 error = actual - prediction
 
-                # Error magnitude per token
-                error_norm = error.norm(dim=-1, keepdim=True)  # (batch, c_len, 1)
+                # Compute z-score in float32 to avoid bfloat16 precision issues
+                # (std can underflow to 0 in bf16 when error norms are similar)
+                error_norm = error.float().norm(dim=-1, keepdim=True)  # (batch, c_len, 1)
 
                 # Z-score within this chunk: tokens compete on relative surprise
-                # Detach mean/std so gradients flow through error_norm only
                 chunk_mean = error_norm.mean().detach()
-                chunk_std = error_norm.std().detach().clamp(min=1e-6)
+                chunk_std = error_norm.std().detach().clamp(min=1e-4)
                 z = (error_norm - chunk_mean) / chunk_std
+                z = z.clamp(-5.0, 5.0)  # prevent extreme z-scores
 
                 # Map z-score to write strength
                 # z=0 (average surprise) → sigmoid(-0.5) ≈ 0.38
@@ -172,7 +173,7 @@ class FastWeightMemory(nn.Module):
                 # z=-1 (1 std below, expected) → sigmoid(-2.5) ≈ 0.08
                 ws_chunk = torch.sigmoid(
                     self.surprise_scale * z + self.surprise_bias
-                )  # (batch, c_len, 1)
+                ).to(x.dtype)  # back to model dtype
 
                 k_chunk = k_chunk * ws_chunk
                 v_chunk = v_chunk * ws_chunk
