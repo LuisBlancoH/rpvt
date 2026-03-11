@@ -16,10 +16,9 @@ def load_base_model(
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=dtype,
-        device_map=device,
+        dtype=dtype,
         trust_remote_code=True,
-    )
+    ).to(device)
 
     # Freeze everything
     for param in model.parameters():
