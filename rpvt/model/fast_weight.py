@@ -79,6 +79,10 @@ class FastWeightMemory(nn.Module):
         key = self.W_key(x)       # (batch, seq_len, memory_size)
         value = self.W_value(x)   # (batch, seq_len, memory_size)
 
+        # L2-normalize keys and values to prevent M from exploding
+        key = torch.nn.functional.normalize(key, dim=-1)
+        value = torch.nn.functional.normalize(value, dim=-1)
+
         retrieved_chunks = []
         M = self.M.clone()  # (memory_size, memory_size)
 
@@ -91,12 +95,11 @@ class FastWeightMemory(nn.Module):
             r_chunk = torch.matmul(q_chunk, M.T)           # (batch, c_len, memory_size)
             retrieved_chunks.append(r_chunk)
 
-            # Write: accumulate all outer products from this chunk
+            # Write: mean outer product over batch and chunk tokens
             k_chunk = key[:, chunk_start:chunk_end, :]     # (batch, c_len, memory_size)
             v_chunk = value[:, chunk_start:chunk_end, :]   # (batch, c_len, memory_size)
 
-            # Sum of outer products, averaged over batch
-            chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / batch
+            chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
             M = (self.decay ** c_len) * M + chunk_outer
 
         # Store updated memory (detach — no gradient through memory across calls)
