@@ -149,8 +149,8 @@ def main():
 
     # ── Load data ──
     print("Loading dataset...")
-    train_ds = TokenizedDataset(tokenizer, seq_len=args.seq_len)
-    eval_ds = TokenizedDataset(tokenizer, split="validation", seq_len=args.seq_len)
+    train_ds = TokenizedDataset(tokenizer, seq_len=args.seq_len, max_tokens=5_000_000)
+    eval_ds = TokenizedDataset(tokenizer, split="validation", seq_len=args.seq_len, max_tokens=500_000)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
