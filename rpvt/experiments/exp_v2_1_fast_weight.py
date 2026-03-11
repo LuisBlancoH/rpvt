@@ -98,27 +98,41 @@ class ChunkDataset(torch.utils.data.Dataset):
         return {"input_ids": self.chunks[idx]}
 
 
-def create_model(vocab_size, device, dtype, with_memory=False, memory_size=256, decay=0.99):
-    """Create a 125M GPT-2 model, optionally with fast weight memory."""
-    config = GPT2Config(
-        vocab_size=vocab_size,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
-        n_inner=3072,
-        activation_function="gelu_new",
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
-    )
-    model = GPT2LMHeadModel(config).to(device=device, dtype=dtype)
+def create_model(vocab_size, device, dtype, with_memory=False, memory_size=256, decay=0.99,
+                  pretrained=False, freeze_base=False):
+    """Create a GPT-2 model, optionally with fast weight memory.
+
+    Args:
+        pretrained: If True, load pretrained GPT-2 weights instead of random init.
+        freeze_base: If True, freeze all non-memory parameters (only train memory projections).
+    """
+    if pretrained:
+        print("  Loading pretrained GPT-2...")
+        model = GPT2LMHeadModel.from_pretrained("gpt2").to(device=device, dtype=dtype)
+    else:
+        config = GPT2Config(
+            vocab_size=vocab_size,
+            n_embd=768,
+            n_layer=12,
+            n_head=12,
+            n_inner=3072,
+            activation_function="gelu_new",
+            resid_pdrop=0.1,
+            embd_pdrop=0.1,
+            attn_pdrop=0.1,
+        )
+        model = GPT2LMHeadModel(config).to(device=device, dtype=dtype)
+
+    if freeze_base:
+        for param in model.parameters():
+            param.requires_grad = False
 
     memory_modules = []
     if with_memory:
         memory_modules = attach_fast_weight_memory(
             model.transformer.h,
-            hidden_size=config.n_embd,
-            layer_indices=list(range(config.n_layer)),
+            hidden_size=model.config.n_embd,
+            layer_indices=list(range(model.config.n_layer)),
             memory_size=memory_size,
             decay=decay,
         )
@@ -298,6 +312,62 @@ def memory_ablation(model, val_loader, device):
     return loss_with, loss_without
 
 
+def run_ablation_and_summary(model, val_loader, device, results, output_dir):
+    """Run memory ablation, print gate values and summary, save results."""
+
+    # ── Memory ablation ──
+    print(f"\n{'='*60}")
+    print("ABLATION: Memory active vs zeroed")
+    print(f"{'='*60}")
+
+    loss_with, loss_without = memory_ablation(model, val_loader, device)
+    memory_contribution = loss_without - loss_with
+    print(f"  With memory:    {loss_with:.4f}")
+    print(f"  Without memory: {loss_without:.4f}")
+    print(f"  Memory contribution: {memory_contribution:+.4f}")
+    if memory_contribution > 0.01:
+        print(f"  Model IS using the memory.")
+    elif memory_contribution > 0:
+        print(f"  Model is using memory minimally.")
+    else:
+        print(f"  Model is NOT using the memory.")
+
+    results["ablation"] = {
+        "loss_with_memory": loss_with,
+        "loss_without_memory": loss_without,
+        "memory_contribution": memory_contribution,
+    }
+
+    # ── Final gate values ──
+    print(f"\n{'='*60}")
+    print("GATE VALUES (sigmoid of learned gate parameter)")
+    print(f"{'='*60}")
+    gates = get_gate_values(model)
+    for layer, val in gates.items():
+        bar = "#" * int(val * 50)
+        print(f"  {layer}: {val:.4f} |{bar}")
+    results["final_gates"] = gates
+
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    if "baseline" in results:
+        print(f"  Baseline val loss:  {results['baseline']['val_loss']:.4f}")
+    if "memory" in results:
+        print(f"  Memory val loss:    {results['memory']['val_loss']:.4f}")
+    if "baseline" in results and "memory" in results:
+        diff = results["baseline"]["val_loss"] - results["memory"]["val_loss"]
+        print(f"  Difference:         {diff:+.4f} ({'memory better' if diff > 0 else 'baseline better'})")
+    print(f"  Memory contribution (ablation): {memory_contribution:+.4f}")
+
+    # Save
+    torch.save(model.state_dict(), Path(output_dir) / "memory_model.pt")
+    with open(Path(output_dir) / "results.json", "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved to {output_dir}/")
+
+
 def main():
     parser = argparse.ArgumentParser(description="v2.1: fast weight memory pretraining")
     parser.add_argument("--memory-size", type=int, default=256)
@@ -315,6 +385,10 @@ def main():
     parser.add_argument("--output-dir", default="results/exp_v2_1")
     parser.add_argument("--skip-baseline", action="store_true",
                         help="Skip baseline training (if already have results)")
+    parser.add_argument("--pretrained", action="store_true",
+                        help="Use pretrained GPT-2 instead of training from scratch")
+    parser.add_argument("--freeze-base", action="store_true",
+                        help="Freeze transformer weights, only train memory projections")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -345,98 +419,88 @@ def main():
         "val_chunks": len(val_chunks),
     }
 
-    # ── Baseline: no memory ──
-    if not args.skip_baseline:
+    if args.pretrained:
+        # ── Pretrained path: bolt memory onto existing GPT-2 ──
+
+        # First: eval pretrained GPT-2 without memory (our baseline)
         print(f"\n{'='*60}")
-        print("BASELINE: GPT-2 125M (no memory)")
+        print("BASELINE: Pretrained GPT-2 (no memory, no training)")
+        print(f"{'='*60}")
+        model_base = create_model(vocab_size, device, dtype, pretrained=True)[0]
+        val_base = evaluate(model_base, val_loader, device)
+        print(f"  Val loss: {val_base:.4f}")
+        results["baseline"] = {"val_loss": val_base}
+        del model_base
+        torch.cuda.empty_cache()
+
+        # Now: pretrained GPT-2 + memory, continue training
+        mode = "frozen base + memory only" if args.freeze_base else "full fine-tune + memory"
+        print(f"\n{'='*60}")
+        print(f"PRETRAINED + MEMORY ({mode})")
         print(f"{'='*60}")
 
-        model_base = create_model(vocab_size, device, dtype, with_memory=False)[0]
-        val_base, log_base = train_model(
-            model_base, train_loader, val_loader, device,
+        model_mem, memory_modules = create_model(
+            vocab_size, device, dtype,
+            with_memory=True, memory_size=args.memory_size, decay=args.decay,
+            pretrained=True, freeze_base=args.freeze_base,
+        )
+
+        lr = args.lr if not args.freeze_base else args.lr * 3  # higher lr for memory-only
+        val_mem, log_mem = train_model(
+            model_mem, train_loader, val_loader, device,
+            num_epochs=args.epochs, lr=lr,
+            warmup_steps=args.warmup_steps,
+            log_every=args.log_every, eval_every=args.eval_every,
+            model_name="pretrained+memory",
+        )
+        results["memory"] = {"val_loss": val_mem, "log": log_mem}
+
+        run_ablation_and_summary(model_mem, val_loader, device, results, args.output_dir)
+
+    else:
+        # ── From-scratch path (original experiment) ──
+
+        if not args.skip_baseline:
+            print(f"\n{'='*60}")
+            print("BASELINE: GPT-2 125M (no memory)")
+            print(f"{'='*60}")
+
+            model_base = create_model(vocab_size, device, dtype, with_memory=False)[0]
+            val_base, log_base = train_model(
+                model_base, train_loader, val_loader, device,
+                num_epochs=args.epochs, lr=args.lr,
+                warmup_steps=args.warmup_steps,
+                log_every=args.log_every, eval_every=args.eval_every,
+                model_name="baseline",
+            )
+            results["baseline"] = {"val_loss": val_base, "log": log_base}
+
+            torch.save(model_base.state_dict(), Path(args.output_dir) / "baseline.pt")
+            del model_base
+            torch.cuda.empty_cache()
+        else:
+            print("Skipping baseline (--skip-baseline)")
+
+        # Memory model from scratch
+        print(f"\n{'='*60}")
+        print(f"MEMORY: GPT-2 125M + fast weight memory (size={args.memory_size}, decay={args.decay})")
+        print(f"{'='*60}")
+
+        model_mem, memory_modules = create_model(
+            vocab_size, device, dtype,
+            with_memory=True, memory_size=args.memory_size, decay=args.decay,
+        )
+
+        val_mem, log_mem = train_model(
+            model_mem, train_loader, val_loader, device,
             num_epochs=args.epochs, lr=args.lr,
             warmup_steps=args.warmup_steps,
             log_every=args.log_every, eval_every=args.eval_every,
-            model_name="baseline",
+            model_name="memory",
         )
-        results["baseline"] = {"val_loss": val_base, "log": log_base}
+        results["memory"] = {"val_loss": val_mem, "log": log_mem}
 
-        # Save baseline checkpoint
-        torch.save(model_base.state_dict(), Path(args.output_dir) / "baseline.pt")
-        del model_base
-        torch.cuda.empty_cache()
-    else:
-        print("Skipping baseline (--skip-baseline)")
-
-    # ── Memory model ──
-    print(f"\n{'='*60}")
-    print(f"MEMORY: GPT-2 125M + fast weight memory (size={args.memory_size}, decay={args.decay})")
-    print(f"{'='*60}")
-
-    model_mem, memory_modules = create_model(
-        vocab_size, device, dtype,
-        with_memory=True, memory_size=args.memory_size, decay=args.decay,
-    )
-
-    val_mem, log_mem = train_model(
-        model_mem, train_loader, val_loader, device,
-        num_epochs=args.epochs, lr=args.lr,
-        warmup_steps=args.warmup_steps,
-        log_every=args.log_every, eval_every=args.eval_every,
-        model_name="memory",
-    )
-    results["memory"] = {"val_loss": val_mem, "log": log_mem}
-
-    # ── Memory ablation ──
-    print(f"\n{'='*60}")
-    print("ABLATION: Memory active vs zeroed")
-    print(f"{'='*60}")
-
-    loss_with, loss_without = memory_ablation(model_mem, val_loader, device)
-    memory_contribution = loss_without - loss_with
-    print(f"  With memory:    {loss_with:.4f}")
-    print(f"  Without memory: {loss_without:.4f}")
-    print(f"  Memory contribution: {memory_contribution:+.4f}")
-    if memory_contribution > 0.01:
-        print(f"  Model IS using the memory.")
-    elif memory_contribution > 0:
-        print(f"  Model is using memory minimally.")
-    else:
-        print(f"  Model is NOT using the memory.")
-
-    results["ablation"] = {
-        "loss_with_memory": loss_with,
-        "loss_without_memory": loss_without,
-        "memory_contribution": memory_contribution,
-    }
-
-    # ── Final gate values ──
-    print(f"\n{'='*60}")
-    print("GATE VALUES (sigmoid of learned gate parameter)")
-    print(f"{'='*60}")
-    gates = get_gate_values(model_mem)
-    for layer, val in gates.items():
-        bar = "#" * int(val * 50)
-        print(f"  {layer}: {val:.4f} |{bar}")
-    results["final_gates"] = gates
-
-    # ── Summary ──
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
-    if "baseline" in results:
-        print(f"  Baseline val loss:  {results['baseline']['val_loss']:.4f}")
-    print(f"  Memory val loss:    {val_mem:.4f}")
-    if "baseline" in results:
-        diff = results["baseline"]["val_loss"] - val_mem
-        print(f"  Difference:         {diff:+.4f} ({'memory better' if diff > 0 else 'baseline better'})")
-    print(f"  Memory contribution (ablation): {memory_contribution:+.4f}")
-
-    # Save checkpoint and results
-    torch.save(model_mem.state_dict(), Path(args.output_dir) / "memory_model.pt")
-    with open(Path(args.output_dir) / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"\nResults saved to {args.output_dir}/")
+        run_ablation_and_summary(model_mem, val_loader, device, results, args.output_dir)
 
 
 if __name__ == "__main__":
