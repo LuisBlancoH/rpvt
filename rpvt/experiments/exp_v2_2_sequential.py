@@ -210,18 +210,29 @@ def get_wout_norms(model):
     return sum(norms) / len(norms) if norms else 0
 
 
-def get_mean_gate_value(model):
-    """Get mean write gate bias (proxy for gate openness). Returns None if no gate."""
-    values = []
+def get_write_mode_info(model):
+    """Get write mode info for logging. Returns (mode, value) or (None, None)."""
     for layer in model.transformer.h:
         if isinstance(layer, TransformerLayerWithMemory):
             mem = layer.memory
-            if mem.use_write_gate:
-                # Report sigmoid of gate bias as baseline openness
-                values.append(torch.sigmoid(mem.W_gate.bias).item())
-    if not values:
-        return None
-    return sum(values) / len(values)
+            if mem.write_mode == "gate":
+                values = []
+                for l in model.transformer.h:
+                    if isinstance(l, TransformerLayerWithMemory) and l.memory.write_mode == "gate":
+                        values.append(torch.sigmoid(l.memory.W_gate.bias).item())
+                return "gate", sum(values) / len(values)
+            elif mem.write_mode == "surprise":
+                scales, biases = [], []
+                for l in model.transformer.h:
+                    if isinstance(l, TransformerLayerWithMemory) and l.memory.write_mode == "surprise":
+                        scales.append(l.memory.surprise_scale.item())
+                        biases.append(l.memory.surprise_bias.item())
+                avg_scale = sum(scales) / len(scales)
+                avg_bias = sum(biases) / len(biases)
+                return "surprise", (avg_scale, avg_bias)
+            else:
+                return "uniform", None
+    return None, None
 
 
 def train_sequential(
@@ -292,7 +303,7 @@ def train_sequential(
                 tokens_per_sec = (global_step * input_ids.shape[0] * input_ids.shape[1]) / elapsed
                 m_norm = get_memory_norms(model)
                 w_norm = get_wout_norms(model)
-                gate_val = get_mean_gate_value(model)
+                wm_mode, wm_val = get_write_mode_info(model)
 
                 log_entry = {
                     "step": global_step,
@@ -301,15 +312,22 @@ def train_sequential(
                     "tokens_per_sec": tokens_per_sec,
                     "M_norm": m_norm,
                     "W_out_norm": w_norm,
-                    "gate": gate_val,
+                    "write_mode": wm_mode,
+                    "write_mode_val": wm_val,
                 }
                 log_data.append(log_entry)
-                gate_str = f", gate={gate_val:.4f}" if gate_val is not None else ""
+
+                if wm_mode == "gate":
+                    extra = f", gate={wm_val:.4f}"
+                elif wm_mode == "surprise":
+                    extra = f", s_scale={wm_val[0]:.2f}, s_bias={wm_val[1]:.2f}"
+                else:
+                    extra = ""
                 print(
                     f"  [{model_name}] step {global_step}/{total_steps}, "
                     f"loss={avg_loss:.4f}, lr={log_entry['lr']:.2e}, "
                     f"{tokens_per_sec:.0f} tok/s, W_out={w_norm:.2f}, M_norm={m_norm:.2f}"
-                    f"{gate_str}"
+                    f"{extra}"
                 )
 
     return train_losses, log_data
