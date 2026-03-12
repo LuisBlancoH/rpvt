@@ -37,32 +37,13 @@ The predictive M 100% result (128v, gap 5-20, decay 0.999) **did not reproduce**
 | D: Predictive (both) | next chunk | delta | 1.2% |
 | D (original, non-reproducible) | next chunk | delta | ~~100%~~ |
 
-**Conclusion**: No memory mode achieves reliable retrieval. Neither future values nor subtraction nor their combination works. The recall signal is too diluted in the loss (~1/1344 of total gradient).
-
-### Controlled Results (all decay 0.999)
-
-| Config | No Memory | Regular M | Predictive M |
-|--------|-----------|-----------|-------------|
-| 64v, gap 2-8 | 2.0% | 1.6% | 0.8% |
-| 128v, gap 5-20 | — | 0.2% | 1.2% |
-
-All at chance level. M provides no benefit over no-memory baseline.
-
 ### Loss Dilution Problem (root cause)
 
 The recall token is 1 out of N tokens in the sequence. With uniform loss weighting, the recall gradient is ~1/N of total. For a 1344-token sequence (gap 20), the recall signal is 0.07% of the gradient.
 
-The model spends all capacity learning to predict random filler tokens (fixed entropy ~5.5) and gets negligible gradient from the one recall token that matters.
-
 Added `--recall-loss-weight` flag to amplify recall signal.
 
-### Key Discovery 4: Loss Weighting Solves Retrieval
-
-Testing two hypotheses for why M couldn't learn retrieval:
-
-**Hypothesis 1 — Loss dilution**: Recall gradient is ~1/1344 of total. Fix: `--recall-loss-weight 100` (100x weight on recall token).
-
-**Hypothesis 2 — W_out bootstrap**: Zero-initialized W_out blocks gradient flow through M. Fix: `--w-out-std 0.01` (small random init).
+### Key Discovery 4: Loss Weighting Solves Single-Pair Retrieval
 
 **Results** (all: decay 0.999, 64 keys, 128 values, gap 5-20, 20 epochs, whole-doc):
 
@@ -75,27 +56,89 @@ Testing two hypotheses for why M couldn't learn retrieval:
 | Predictive M + W_out 0.01 | W_out init | 0.8% |
 
 **Conclusions:**
-1. **Loss weighting is necessary and sufficient.** 100x recall weight enables perfect retrieval across all gaps (5-20).
-2. **W_out init alone does nothing.** The bootstrap problem is real but secondary — sufficient gradient signal overcomes it even from zero init.
-3. **Both regular M and predictive M achieve 100%.** On this simple store/recall task, the architecture was never the bottleneck — the training signal was.
-4. **The architecture works.** M (linear associative memory / linear attention) can store and retrieve key-value pairs across 20+ chunks. The outer-product accumulation + query mechanism is sufficient for cross-chunk retrieval.
-5. **The original 100% fluke was likely a lucky seed** that happened to initialize W_out in a way that let the weak gradient signal bootstrap retrieval.
+1. **Loss weighting is necessary and sufficient** for single-pair retrieval.
+2. **W_out init alone does nothing.** Sufficient gradient overcomes zero init.
+3. **Both regular M and predictive M achieve 100%.** Architecture not the bottleneck.
 
-### Reproducibility Issues
+### Key Discovery 5: Multi-Pair Capacity Problem
 
-- No-memory baseline: 24% in one run, 2% in another (same config, different random init)
-- Predictive M: 100% in one run, 1.2% in rerun (same config)
+Testing M with multiple store/recall pairs per document (all: decay 0.999, 64 keys, 128 values, gap 5-10, 20 epochs, whole-doc, 100x recall weight):
 
-Single runs are unreliable. Need multiple seeds per config.
+**Uniform write mode + 100x weight:**
+
+| Pairs | Recall | Behavior |
+|---|---|---|
+| 1 | **100%** | Perfect retrieval |
+| 2 | 1.1% | Chance (bad seed) |
+| 4 | 24.9% | Gets 1/4 right consistently |
+| 8 | 5.4% | ~0.4/8 right |
+| 16 | 13.3% | ~2/16 right |
+
+**Key finding**: Model learns a single fixed retrieval pattern, not key-dependent retrieval. It always retrieves the same pair regardless of query key.
+
+**Debug analysis** (from recall-only loss 2-pair run, 47.7%): Pair 0 always correct, pair 1 always gets pair 0's value. The model doesn't use the query key to select which pair to retrieve.
+
+### Key Discovery 6: Write Gate Enables 2-Pair Retrieval
+
+**Gate write mode** (learned sigmoid gate on write strength) + 100x weight:
+
+| Pairs | Uniform + 100x | Gate + 100x |
+|---|---|---|
+| 1 | 100% | — |
+| 2 | 1.1% | **94.4%** |
+| 4 | 24.9% | 25.4% |
+| 8 | 5.4% | 3.4% |
+
+**The gate enables key-dependent retrieval for 2 pairs** (debug shows both pairs correct with different predictions). But it doesn't help for 4+ pairs.
+
+**Why the gate helps**: It learns to write strongly on STORE chunks and weakly on fillers, reducing noise in M. But it can't solve the W_key/W_query coordination problem for 4+ keys.
+
+**Why it fails at 4+ pairs**: W_key and W_query are separate projections. The model must learn them to map the same key token (in STORE vs RECALL context) to matching vectors. This coordination is easy for 2 keys but hard for 4+.
+
+### Approaches Tried for Multi-Pair (4 pairs)
+
+| Approach | 2 pairs | 4 pairs | Notes |
+|---|---|---|---|
+| Uniform + 100x weight | 1.1% | 24.9% | Single retrieval pattern |
+| Recall-only loss | 47.7% | — | Gets 1/2 right (pair 0 always) |
+| Key at position -2 | 1.4% | 0.7% | Key visibility not the issue |
+| Curriculum (1→N pairs) | 11.0% | 13.7% | Disrupts learned retrieval |
+| Gate + recall-only | 47.1% | — | Same as recall-only |
+| **Gate + 100x** | **94.4%** | 25.4% | Works for 2 but not 4 |
+| Gate + 100x, 512d model | — | 0.8% | Larger model worse (optimization) |
+| Gate + 100x, 8-layer | — | running | |
+
+### Currently Running Experiments
+
+**Testing architectural fixes for 4-pair retrieval** (all: gate + 100x, 4 pairs, decay 0.999):
+
+1. **Tied Q=K** (`--tie-qk`): Share W_query = W_key so same key token produces matching vectors for both storage and retrieval
+2. **Delta rule** (`--delta-rule`): `M += k⊗(v - Mk)` — subtract old association before writing to reduce interference
+3. **Hard gate** (`--gate-bias -5`): Gate init at sigmoid(-5)≈0.007 instead of sigmoid(-2)≈0.12 for more aggressive filler suppression
+4. **Tied Q=K + delta**: Both fixes combined
+5. **All three**: Kitchen sink
+
+Also running:
+- Gate + 100x, 16 pairs (capacity test)
+- Gate + 100x, 4 pairs, 8-layer model (depth test)
+
+### High Variance Problem
+
+Same config gives wildly different results depending on random init:
+- 2 pairs uniform: 1.1% vs 47.7% (different loss modes but same arch)
+- 8 pairs key-fix: 44.6% vs original 5.4%
+- Original predictive: 100% vs 1.2%
+
+The optimization landscape has multiple basins. Most don't involve M. The model easily falls into "ignore M" local minima.
 
 ### Open Questions
 
-1. ~~Does recall-weighted loss enable retrieval?~~ **Yes — 100% for both modes.**
-2. ~~Does it work for regular M too?~~ **Yes — regular M is sufficient.**
-3. Does M still work with harder tasks (multiple store/recall pairs, longer gaps, interference)?
-4. Does predictive M offer advantages on tasks requiring anticipation/planning?
-5. What is the minimum recall-loss-weight needed? (somewhere between 1x and 100x)
-6. Need 3+ seeds per config for reliable results
+1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair.**
+2. ~~Does M scale to multiple pairs?~~ **Not yet — fails at 4+ pairs.**
+3. Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?
+4. Is the problem fundamentally optimization (need more seeds/training) or architectural?
+5. Does predictive M offer advantages on anticipation/planning tasks?
+6. Multi-timescale memory for agent planning (long-term vision)
 
 ---
 *Last updated: 2026-03-12*
