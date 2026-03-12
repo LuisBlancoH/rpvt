@@ -221,8 +221,8 @@ def get_write_mode_info(model):
                     if isinstance(l, TransformerLayerWithMemory) and l.memory.write_mode == "gate":
                         values.append(torch.sigmoid(l.memory.W_gate.bias).item())
                 return "gate", sum(values) / len(values)
-            elif mem.write_mode == "surprise":
-                return "surprise", (mem.surprise_scale, mem.surprise_bias)
+            elif mem.write_mode in ("surprise", "surprise-fwd"):
+                return mem.write_mode, (mem.surprise_scale, mem.surprise_bias)
             else:
                 return "uniform", None
     return None, None
@@ -281,8 +281,43 @@ def train_sequential(
             outputs = model(input_ids, labels=input_ids)
             loss = outputs.loss
 
+            # ── NaN detection: enable debug mode and re-run to trace origin ──
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n  [NaN DETECTED] step {global_step + 1}, loss={loss.item()}")
+                print(f"    Enabling NaN debug mode and re-running this forward pass...")
+                # Enable debug on all memory modules
+                for layer in model.transformer.h:
+                    if isinstance(layer, TransformerLayerWithMemory):
+                        layer.memory._nan_debug = True
+                # Re-run forward to get debug prints
+                with torch.no_grad():
+                    debug_out = model(input_ids, labels=input_ids)
+                    print(f"    Debug forward loss: {debug_out.loss.item()}")
+                # Check gradients from previous step
+                nan_grad_count = sum(
+                    1 for p in model.parameters()
+                    if p.requires_grad and p.grad is not None and torch.isnan(p.grad).any()
+                )
+                print(f"    Params with NaN grads (from prev step): {nan_grad_count}")
+                # Disable debug
+                for layer in model.transformer.h:
+                    if isinstance(layer, TransformerLayerWithMemory):
+                        layer.memory._nan_debug = False
+
             optimizer.zero_grad()
             loss.backward()
+
+            # ── NaN check on gradients ──
+            nan_grad_params = [
+                (name, p.grad.norm().item())
+                for name, p in model.named_parameters()
+                if p.requires_grad and p.grad is not None and torch.isnan(p.grad).any()
+            ]
+            if nan_grad_params:
+                print(f"\n  [NaN GRADS] step {global_step + 1}: {len(nan_grad_params)} params")
+                for name, norm in nan_grad_params[:5]:
+                    print(f"    {name}: grad_norm={norm}")
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
@@ -312,7 +347,7 @@ def train_sequential(
 
                 if wm_mode == "gate":
                     extra = f", gate={wm_val:.4f}"
-                elif wm_mode == "surprise":
+                elif wm_mode in ("surprise", "surprise-fwd"):
                     extra = f", s={wm_val[0]:.1f}, b={wm_val[1]:.1f}"
                 else:
                     extra = ""
@@ -426,6 +461,95 @@ def evaluate_by_position_no_memory(model, dataset, device):
             chunk_in_doc += 1
 
     return {pos: sum(losses) / len(losses) for pos, losses in sorted(position_losses.items())}
+
+
+def evaluate_memory_reset_ablation(model, dataset, device, reset_at_positions=(3, 5, 8)):
+    """Test whether M stores real document-specific information.
+
+    For each reset_at position K:
+        - Run the document normally up to chunk K
+        - Reset M at chunk K (erasing all accumulated context)
+        - Measure loss at chunk K+1
+
+    Compare against:
+        - Normal M (no reset): loss at K+1 with full history
+        - No M (always reset): loss at K+1 with no history
+
+    If M stores real document info, resetting at K should hurt more as K
+    increases (more information lost). If M is just an adapter, resetting
+    won't matter because it rebuilds the same state from any single chunk.
+    """
+    model.eval()
+
+    # We need to run the same documents multiple times with different reset points
+    # First, collect documents (groups of sequential chunks)
+    documents = {}  # doc_id -> list of (chunk_idx_in_doc, input_ids)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False,
+                        collate_fn=sequential_collate_fn)
+    chunk_in_doc = 0
+    prev_doc_id = None
+
+    for batch in loader:
+        doc_id = batch["doc_ids"][0]
+        is_first = batch["is_first"][0]
+        if is_first or (prev_doc_id is not None and doc_id != prev_doc_id):
+            chunk_in_doc = 0
+        if doc_id not in documents:
+            documents[doc_id] = []
+        documents[doc_id].append(batch["input_ids"])
+        chunk_in_doc += 1
+        prev_doc_id = doc_id
+
+    # Only use documents long enough for the largest reset position
+    max_reset = max(reset_at_positions)
+    long_docs = {did: chunks for did, chunks in documents.items()
+                 if len(chunks) > max_reset + 1}
+
+    results = {}  # reset_pos -> {"normal": loss, "reset": loss, "no_memory": loss}
+
+    for reset_pos in reset_at_positions:
+        normal_losses = []
+        reset_losses = []
+        no_memory_losses = []
+
+        with torch.no_grad():
+            for doc_id, chunks in long_docs.items():
+                # ── Run 1: Normal (M accumulates) ──
+                reset_memories(model)
+                for i in range(reset_pos + 2):  # run through chunk reset_pos+1
+                    input_ids = chunks[i].to(device)
+                    outputs = model(input_ids, labels=input_ids)
+                    if i == reset_pos + 1:
+                        normal_losses.append(outputs.loss.item())
+
+                # ── Run 2: Reset M at position K, then measure K+1 ──
+                reset_memories(model)
+                for i in range(reset_pos + 2):
+                    input_ids = chunks[i].to(device)
+                    if i == reset_pos:
+                        reset_memories(model)  # erase accumulated context
+                    outputs = model(input_ids, labels=input_ids)
+                    if i == reset_pos + 1:
+                        reset_losses.append(outputs.loss.item())
+
+                # ── Run 3: No memory (reset before every chunk) ──
+                reset_memories(model)
+                for i in range(reset_pos + 2):
+                    input_ids = chunks[i].to(device)
+                    reset_memories(model)
+                    outputs = model(input_ids, labels=input_ids)
+                    if i == reset_pos + 1:
+                        no_memory_losses.append(outputs.loss.item())
+
+        results[reset_pos] = {
+            "normal": sum(normal_losses) / len(normal_losses),
+            "reset": sum(reset_losses) / len(reset_losses),
+            "no_memory": sum(no_memory_losses) / len(no_memory_losses),
+            "reset_cost": (sum(reset_losses) - sum(normal_losses)) / len(normal_losses),
+            "n_docs": len(long_docs),
+        }
+
+    return results
 
 
 def main():

@@ -79,16 +79,24 @@ class FastWeightMemory(nn.Module):
             self.use_write_gate = write_mode == "gate"
 
         # Surprise-driven write strength (z-score normalized)
-        if write_mode == "surprise":
+        if write_mode in ("surprise", "surprise-fwd"):
             # Write strength = sigmoid(scale * z + bias)
             # where z = (||error|| - chunk_mean) / (chunk_std + eps)
             # z is computed per-chunk so tokens within the same chunk
             # get different write strengths based on relative surprise.
             #
+            # "surprise": error = current chunk - M's prediction (backward-looking)
+            # "surprise-fwd": error = NEXT chunk - M's prediction (forward-looking)
+            #   Forward surprise writes strongly when M can't predict what's coming,
+            #   forcing M to store forward-predictive content rather than adapter effects.
+            #
             # scale controls sensitivity: higher = more differentiation
             # bias controls baseline: negative = write less on average
             self.surprise_scale = 2.0   # hyperparameter, not learned
             self.surprise_bias = -0.5   # sigmoid(-0.5) ≈ 0.38 at mean error
+
+        # NaN debugging flag — set to True to enable per-chunk NaN tracing
+        self._nan_debug = False
 
         # Memory matrix — not a parameter, not saved, starts at zero
         self.register_buffer("M", torch.zeros(memory_size, memory_size))
@@ -138,6 +146,11 @@ class FastWeightMemory(nn.Module):
             r_chunk = torch.matmul(q_chunk, M.T)           # (batch, c_len, memory_size)
             retrieved_chunks.append(r_chunk)
 
+            # ── NaN check: after read ──
+            if self._nan_debug and (torch.isnan(r_chunk).any() or torch.isinf(r_chunk).any()):
+                print(f"[NaN DEBUG] r_chunk has nan/inf at chunk_start={chunk_start}, "
+                      f"M_norm={M.norm().item():.4f}, q_norm={q_chunk.norm().item():.4f}")
+
             # ── COMPUTE WRITE STRENGTH ──
             k_chunk = key[:, chunk_start:chunk_end, :]     # (batch, c_len, memory_size)
             v_chunk = value[:, chunk_start:chunk_end, :]   # (batch, c_len, memory_size)
@@ -151,11 +164,35 @@ class FastWeightMemory(nn.Module):
                 v_chunk = v_chunk * ws_chunk
                 write_strength_log.append(ws_chunk.mean().item())
 
-            elif self.write_mode == "surprise":
+            elif self.write_mode in ("surprise", "surprise-fwd"):
                 # Prediction: what does M think the hidden state should be?
                 prediction = self.W_out(r_chunk)  # (batch, c_len, hidden_size)
-                actual = x[:, chunk_start:chunk_end, :]  # (batch, c_len, hidden_size)
+
+                if self.write_mode == "surprise":
+                    # Backward-looking: compare prediction to current chunk
+                    actual = x[:, chunk_start:chunk_end, :]  # (batch, c_len, hidden_size)
+                else:
+                    # Forward-looking: compare prediction to NEXT chunk
+                    # M should write strongly when it can't predict what's coming
+                    next_start = min(chunk_end, seq_len - c_len)
+                    next_end = next_start + c_len
+                    if next_end <= seq_len and next_start != chunk_start:
+                        actual = x[:, next_start:next_end, :]
+                    else:
+                        # Last chunk: fall back to current chunk
+                        actual = x[:, chunk_start:chunk_end, :]
+
                 error = actual - prediction
+
+                # ── NaN check: surprise prediction path ──
+                if self._nan_debug and (torch.isnan(prediction).any() or torch.isinf(prediction).any()):
+                    print(f"[NaN DEBUG] prediction has nan/inf at chunk_start={chunk_start}, "
+                          f"r_chunk_norm={r_chunk.norm().item():.4f}, "
+                          f"W_out_norm={self.W_out.weight.norm().item():.4f}")
+                if self._nan_debug and (torch.isnan(error).any() or torch.isinf(error).any()):
+                    print(f"[NaN DEBUG] error has nan/inf at chunk_start={chunk_start}, "
+                          f"pred_norm={prediction.norm().item():.4f}, "
+                          f"actual_norm={actual.norm().item():.4f}")
 
                 # Compute z-score in float32 to avoid bfloat16 precision issues
                 # (std can underflow to 0 in bf16 when error norms are similar)
@@ -167,6 +204,12 @@ class FastWeightMemory(nn.Module):
                 z = (error_norm - chunk_mean) / chunk_std
                 z = z.clamp(-5.0, 5.0)  # prevent extreme z-scores
 
+                # ── NaN check: z-score path ──
+                if self._nan_debug and (torch.isnan(z).any() or torch.isinf(z).any()):
+                    print(f"[NaN DEBUG] z has nan/inf at chunk_start={chunk_start}, "
+                          f"error_norm range=[{error_norm.min().item():.4f}, {error_norm.max().item():.4f}], "
+                          f"chunk_mean={chunk_mean.item():.4f}, chunk_std={chunk_std.item():.6f}")
+
                 # Map z-score to write strength
                 # z=0 (average surprise) → sigmoid(-0.5) ≈ 0.38
                 # z=+1 (1 std above, surprising) → sigmoid(1.5) ≈ 0.82
@@ -175,6 +218,11 @@ class FastWeightMemory(nn.Module):
                     self.surprise_scale * z + self.surprise_bias
                 ).to(x.dtype)  # back to model dtype
 
+                # ── NaN check: write strength ──
+                if self._nan_debug and (torch.isnan(ws_chunk).any() or torch.isinf(ws_chunk).any()):
+                    print(f"[NaN DEBUG] ws_chunk has nan/inf at chunk_start={chunk_start}, "
+                          f"z range=[{z.min().item():.4f}, {z.max().item():.4f}]")
+
                 k_chunk = k_chunk * ws_chunk
                 v_chunk = v_chunk * ws_chunk
                 write_strength_log.append(ws_chunk.mean().item())
@@ -182,6 +230,14 @@ class FastWeightMemory(nn.Module):
             # ── WRITE ──
             chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
             M = (self.decay ** c_len) * M + chunk_outer
+
+            # ── NaN check: after write ──
+            if self._nan_debug and (torch.isnan(chunk_outer).any() or torch.isinf(chunk_outer).any()):
+                print(f"[NaN DEBUG] chunk_outer has nan/inf at chunk_start={chunk_start}, "
+                      f"v_norm={v_chunk.norm().item():.4f}, k_norm={k_chunk.norm().item():.4f}")
+            if self._nan_debug and (torch.isnan(M).any() or torch.isinf(M).any()):
+                print(f"[NaN DEBUG] M has nan/inf after write at chunk_start={chunk_start}, "
+                      f"chunk_outer_norm={chunk_outer.norm().item():.4f}")
 
             # Cap M norm to prevent explosion at slow decay rates
             if self.max_m_norm > 0:
@@ -194,6 +250,13 @@ class FastWeightMemory(nn.Module):
 
         retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
         output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
+
+        # Clamp memory output to prevent destabilizing the residual stream.
+        # At high decay rates, W_out * (M @ query) can produce outputs large
+        # enough to blow up the transformer's hidden states.
+        max_output_norm = 10.0
+        output_norm = output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        output = output * (max_output_norm / output_norm).clamp(max=1.0)
 
         mean_ws = sum(write_strength_log) / len(write_strength_log) if write_strength_log else None
         return output, mean_ws

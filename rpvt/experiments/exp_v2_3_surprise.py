@@ -43,6 +43,7 @@ from rpvt.experiments.exp_v2_2_sequential import (
     train_sequential,
     evaluate_by_position,
     evaluate_by_position_no_memory,
+    evaluate_memory_reset_ablation,
     reset_memories,
 )
 
@@ -56,7 +57,7 @@ def main():
                         help="Multiple decay rates to sweep (overrides --decay)")
     parser.add_argument("--write-modes", type=str, nargs="+",
                         default=["uniform", "surprise"],
-                        choices=["uniform", "gate", "surprise"],
+                        choices=["uniform", "gate", "surprise", "surprise-fwd"],
                         help="Write modes to compare")
     parser.add_argument("--max-m-norm", type=float, default=10.0,
                         help="Cap on M's Frobenius norm (0 = no cap)")
@@ -131,7 +132,7 @@ def main():
             print(f"  Trainable params: {n_trainable:,}")
 
             # Show surprise hyperparams
-            if write_mode == "surprise":
+            if write_mode in ("surprise", "surprise-fwd"):
                 mem = memory_modules[0]
                 print(f"  surprise_scale: {mem.surprise_scale:.1f}")
                 print(f"  surprise_bias:  {mem.surprise_bias:.1f}")
@@ -175,6 +176,19 @@ def main():
             else:
                 print(f"  -> Memory benefit DECREASES with position")
 
+            # ── Memory reset ablation: is M real memory or just adapter? ──
+            print(f"\n  Memory reset ablation (adapter vs real memory)...")
+            reset_ablation = evaluate_memory_reset_ablation(
+                model, seq_dataset, device, reset_at_positions=(3, 5, 8, 12),
+            )
+            print(f"\n  {'Reset@':>8} | {'Normal':>8} | {'Reset':>8} | {'No M':>8} | {'Reset Cost':>10}")
+            print(f"  {'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*10}")
+            for pos, r in sorted(reset_ablation.items()):
+                print(f"  {f'K={pos}':>8} | {r['normal']:.4f} | {r['reset']:.4f} | "
+                      f"{r['no_memory']:.4f} | {r['reset_cost']:+.4f}")
+            print(f"\n  If reset_cost grows with K -> M stores real document info")
+            print(f"  If reset_cost is flat/zero -> M is just an adapter")
+
             all_results["runs"][run_key] = {
                 "decay": decay,
                 "write_mode": write_mode,
@@ -184,6 +198,7 @@ def main():
                 "early_benefit": early_benefit,
                 "late_benefit": late_benefit,
                 "growth": growth,
+                "reset_ablation": {str(k): v for k, v in reset_ablation.items()},
                 "training_log": log_data,
             }
 
