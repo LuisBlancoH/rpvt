@@ -58,6 +58,7 @@ class SyntheticRecallDataset(Dataset):
         chunk_size=64,
         n_keys=32,
         n_values=64,
+        n_pairs=1,
         filler_vocab_size=256,
         seed=42,
     ):
@@ -65,6 +66,7 @@ class SyntheticRecallDataset(Dataset):
         self.chunk_size = chunk_size
         self.n_keys = n_keys
         self.n_values = n_values
+        self.n_pairs = n_pairs
 
         # Special tokens (offset above filler vocab)
         self.STORE = filler_vocab_size
@@ -80,35 +82,51 @@ class SyntheticRecallDataset(Dataset):
 
         for _ in range(n_docs):
             gap = torch.randint(gap_range[0], gap_range[1] + 1, (1,), generator=rng).item()
-            key_id = torch.randint(0, n_keys, (1,), generator=rng).item()
-            value_id = torch.randint(0, n_values, (1,), generator=rng).item()
+
+            # Generate n_pairs distinct key-value pairs per document
+            pairs = []
+            used_keys = set()
+            for _ in range(n_pairs):
+                # Ensure unique keys within a document
+                key_id = torch.randint(0, n_keys, (1,), generator=rng).item()
+                while key_id in used_keys and len(used_keys) < n_keys:
+                    key_id = torch.randint(0, n_keys, (1,), generator=rng).item()
+                used_keys.add(key_id)
+                value_id = torch.randint(0, n_values, (1,), generator=rng).item()
+                pairs.append((key_id, value_id))
 
             chunks = []
 
-            # Chunk 0: STORE key value PAD...
-            store_chunk = torch.full((chunk_size,), self.PAD, dtype=torch.long)
-            store_chunk[0] = self.STORE
-            store_chunk[1] = self.key_offset + key_id
-            store_chunk[2] = self.value_offset + value_id
-            chunks.append(store_chunk)
+            # Store chunks (one per pair)
+            for key_id, value_id in pairs:
+                store_chunk = torch.full((chunk_size,), self.PAD, dtype=torch.long)
+                store_chunk[0] = self.STORE
+                store_chunk[1] = self.key_offset + key_id
+                store_chunk[2] = self.value_offset + value_id
+                chunks.append(store_chunk)
 
-            # Filler chunks
+            # Filler chunks (gap-1 to maintain backward compat: gap = chunks from store to recall)
             for _ in range(gap - 1):
                 filler = torch.randint(0, filler_vocab_size, (chunk_size,), generator=rng)
                 chunks.append(filler)
 
-            # Recall chunk: RECALL key PAD... value (value is the LAST token)
-            recall_chunk = torch.full((chunk_size,), self.PAD, dtype=torch.long)
-            recall_chunk[0] = self.RECALL
-            recall_chunk[1] = self.key_offset + key_id
-            recall_chunk[-1] = self.value_offset + value_id
-            chunks.append(recall_chunk)
+            # Recall chunks (one per pair, same order as stores)
+            # Key is placed at position -2 (right before value) so the model
+            # can easily form key-dependent queries at the prediction position.
+            for key_id, value_id in pairs:
+                recall_chunk = torch.full((chunk_size,), self.PAD, dtype=torch.long)
+                recall_chunk[0] = self.RECALL
+                recall_chunk[-2] = self.key_offset + key_id
+                recall_chunk[-1] = self.value_offset + value_id
+                chunks.append(recall_chunk)
 
             self.documents.append({
                 "chunks": chunks,
-                "key_id": key_id,
-                "value_id": value_id,
+                "pairs": pairs,
                 "gap": gap,
+                # Keep single-pair compat
+                "key_id": pairs[0][0],
+                "value_id": pairs[0][1],
             })
 
         # Flatten into sequential chunks with doc boundaries
@@ -119,29 +137,41 @@ class SyntheticRecallDataset(Dataset):
         self.recall_value_id = []
 
         for doc_idx, doc in enumerate(self.documents):
+            n_chunks = len(doc["chunks"])
             for chunk_idx, chunk in enumerate(doc["chunks"]):
                 self.all_chunks.append(chunk)
                 self.doc_ids.append(doc_idx)
                 self.is_first.append(chunk_idx == 0)
-                is_recall_chunk = (chunk_idx == len(doc["chunks"]) - 1)
+                # Recall chunks are the last n_pairs chunks
+                recall_pair_idx = chunk_idx - (n_chunks - n_pairs)
+                is_recall_chunk = recall_pair_idx >= 0
                 self.is_recall.append(is_recall_chunk)
                 self.recall_value_id.append(
-                    doc["value_id"] if is_recall_chunk else -1
+                    doc["pairs"][recall_pair_idx][1] if is_recall_chunk else -1
                 )
 
         # Also build whole-document sequences (concatenated chunks)
-        self.doc_sequences = []  # list of (input_ids_tensor, value_id, gap)
+        self.doc_sequences = []
         for doc in self.documents:
             seq = torch.cat(doc["chunks"])  # (n_chunks * chunk_size,)
+            # Recall value positions: last token of each recall chunk
+            # Recall chunks start at index (n_pairs + gap - 1)
+            recall_positions = []
+            for i in range(n_pairs):
+                recall_chunk_idx = n_pairs + (doc["gap"] - 1) + i
+                pos = (recall_chunk_idx + 1) * chunk_size - 1  # last token of chunk
+                recall_positions.append(pos)
             self.doc_sequences.append({
                 "input_ids": seq,
+                "pairs": doc["pairs"],
                 "value_id": doc["value_id"],
                 "gap": doc["gap"],
+                "recall_positions": recall_positions,
             })
 
         print(f"  SyntheticRecall: {n_docs} docs, {len(self.all_chunks)} chunks, "
               f"gap range {gap_range}, {n_keys} keys, {n_values} values, "
-              f"vocab size {self.vocab_size}")
+              f"{n_pairs} pairs/doc, vocab size {self.vocab_size}")
 
     def __len__(self):
         return len(self.all_chunks)
@@ -233,7 +263,8 @@ def reset_memories(model):
 def train_and_eval(
     model, train_dataset, eval_dataset, device,
     num_epochs=10, lr=1e-3, log_every=50, model_name="model",
-    whole_doc=False, recall_loss_weight=1.0,
+    whole_doc=False, recall_loss_weight=1.0, recall_only_loss=False,
+    curriculum_train_data=None,
 ):
     """Train and evaluate.
 
@@ -243,6 +274,9 @@ def train_and_eval(
     recall_loss_weight: multiply the loss at the recall position by this factor.
     Default 1.0 = uniform weighting. Higher values (e.g. 100) amplify the
     recall signal so it doesn't get buried by filler token predictions.
+
+    curriculum_train_data: if provided, train on this (1-pair) dataset for the
+    first half of epochs, then switch to train_dataset (N-pair) for the rest.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
@@ -250,6 +284,8 @@ def train_and_eval(
         total_steps = len(train_dataset.doc_sequences) * num_epochs
     else:
         total_steps = len(train_dataset.all_chunks) * num_epochs
+
+    curriculum_switch_epoch = num_epochs // 2 if curriculum_train_data is not None else 0
 
     def lr_schedule(step):
         warmup = 100
@@ -261,29 +297,48 @@ def train_and_eval(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
     print(f"\nTraining {model_name}: {total_steps} steps, whole_doc={whole_doc}")
+    if curriculum_train_data is not None:
+        print(f"  Curriculum: epochs 1-{curriculum_switch_epoch} = 1 pair, "
+              f"epochs {curriculum_switch_epoch+1}-{num_epochs} = {train_dataset.n_pairs} pairs")
     model.train()
     global_step = 0
     train_losses = []
     start_time = time.time()
 
     for epoch in range(num_epochs):
+        # Curriculum: use 1-pair data for first half, N-pair for second half
+        if curriculum_train_data is not None and epoch < curriculum_switch_epoch:
+            active_dataset = curriculum_train_data
+            phase = "phase1"
+        else:
+            active_dataset = train_dataset
+            phase = "phase2" if curriculum_train_data is not None else ""
+
+        if curriculum_train_data is not None and epoch == curriculum_switch_epoch:
+            print(f"  [{model_name}] === CURRICULUM SWITCH: 1 pair → {train_dataset.n_pairs} pairs ===")
+
         if whole_doc:
             # Feed entire documents as single sequences
-            for doc in train_dataset.doc_sequences:
+            for doc in active_dataset.doc_sequences:
                 input_ids = doc["input_ids"].unsqueeze(0).to(device)  # (1, n_chunks*chunk_size)
                 reset_memories(model)
 
                 output = model(input_ids, labels=input_ids)
 
-                if recall_loss_weight > 1.0:
-                    # Recompute loss with extra weight on the recall position
-                    # Position -2 in logits predicts position -1 in labels (the value token)
+                if recall_only_loss or recall_loss_weight > 1.0:
+                    # Recompute loss with custom weighting on recall positions
                     logits = output.logits[:, :-1].reshape(-1, output.logits.size(-1))
                     targets = input_ids[:, 1:].reshape(-1)
                     per_token_loss = F.cross_entropy(logits, targets, reduction='none')
-                    # Weight: all tokens get 1.0, recall position gets extra
-                    weights = torch.ones_like(per_token_loss)
-                    weights[-1] = recall_loss_weight  # last prediction = recall
+                    if recall_only_loss:
+                        # Zero weight on everything except recall positions
+                        weights = torch.zeros_like(per_token_loss)
+                    else:
+                        weights = torch.ones_like(per_token_loss)
+                    # Weight all recall positions (last token of each recall chunk)
+                    for rpos in doc["recall_positions"]:
+                        # logit at rpos-1 predicts token at rpos
+                        weights[rpos - 1] = recall_loss_weight if not recall_only_loss else 1.0
                     loss = (per_token_loss * weights).sum() / weights.sum()
                 else:
                     loss = output.loss
@@ -417,6 +472,7 @@ def evaluate_recall_whole_doc(model, dataset, device, model_name="model"):
     correct_by_gap = {}
     total_by_gap = {}
 
+    debug_count = 0
     with torch.no_grad():
         for doc in dataset.doc_sequences:
             input_ids = doc["input_ids"].unsqueeze(0).to(device)
@@ -424,18 +480,32 @@ def evaluate_recall_whole_doc(model, dataset, device, model_name="model"):
 
             output = model(input_ids, labels=input_ids)
 
-            # The value token is at position -1, so logits at -2 predict it
-            logits = output.logits[0, -2, :]
-            value_token = dataset.value_offset + doc["value_id"]
-            predicted = logits.argmax().item()
-
-            if predicted == value_token:
-                correct += 1
-            total += 1
-
             gap = doc["gap"]
-            correct_by_gap[gap] = correct_by_gap.get(gap, 0) + (1 if predicted == value_token else 0)
-            total_by_gap[gap] = total_by_gap.get(gap, 0) + 1
+            # Check each recall position
+            for i, (key_id, value_id) in enumerate(doc["pairs"]):
+                rpos = doc["recall_positions"][i]
+                # Logit at rpos-1 predicts token at rpos
+                logits = output.logits[0, rpos - 1, :]
+                value_token = dataset.value_offset + value_id
+                predicted = logits.argmax().item()
+
+                if predicted == value_token:
+                    correct += 1
+                total += 1
+
+                correct_by_gap[gap] = correct_by_gap.get(gap, 0) + (1 if predicted == value_token else 0)
+                total_by_gap[gap] = total_by_gap.get(gap, 0) + 1
+
+                # Debug: print top predictions for first 5 docs
+                if debug_count < 10:
+                    top5 = logits.topk(5)
+                    top5_tokens = top5.indices.tolist()
+                    top5_vals = [f"{v:.2f}" for v in top5.values.tolist()]
+                    is_value = "Y" if predicted == value_token else "N"
+                    print(f"  [debug] pair {i}: key={key_id} expected_val={value_id} "
+                          f"predicted={predicted} correct={is_value} "
+                          f"top5={list(zip(top5_tokens, top5_vals))}")
+                    debug_count += 1
 
     accuracy = correct / max(total, 1)
     print(f"\n  [{model_name}] Recall accuracy: {correct}/{total} = {accuracy:.1%}")
@@ -523,9 +593,15 @@ def main():
                         help="W_out init std (0 = zero init, >0 = random init for gradient bootstrap)")
     parser.add_argument("--recall-loss-weight", type=float, default=1.0,
                         help="Extra weight on recall token loss (1.0 = uniform, 100 = 100x recall)")
+    parser.add_argument("--recall-only-loss", action="store_true",
+                        help="Compute loss ONLY on recall positions (zero weight on all other tokens)")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Curriculum: train first half with 1 pair, second half with n-pairs")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
+    parser.add_argument("--n-pairs", type=int, default=1,
+                        help="Number of key-value pairs per document (capacity test)")
     parser.add_argument("--gap-min", type=int, default=2)
     parser.add_argument("--gap-max", type=int, default=8)
     parser.add_argument("--n-train", type=int, default=2000)
@@ -548,19 +624,32 @@ def main():
     train_data = SyntheticRecallDataset(
         n_docs=args.n_train, gap_range=(args.gap_min, args.gap_max),
         chunk_size=args.chunk_size, n_keys=args.n_keys, n_values=args.n_values,
-        seed=42,
+        n_pairs=args.n_pairs, seed=42,
     )
     eval_data = SyntheticRecallDataset(
         n_docs=args.n_eval, gap_range=(args.gap_min, args.gap_max),
         chunk_size=args.chunk_size, n_keys=args.n_keys, n_values=args.n_values,
-        seed=1337,
+        n_pairs=args.n_pairs, seed=1337,
     )
+
+    # Curriculum: also create 1-pair dataset for phase 1
+    curriculum_train_data = None
+    if args.curriculum and args.n_pairs > 1:
+        print("  Creating curriculum phase 1 dataset (1 pair)...")
+        curriculum_train_data = SyntheticRecallDataset(
+            n_docs=args.n_train, gap_range=(args.gap_min, args.gap_max),
+            chunk_size=args.chunk_size, n_keys=args.n_keys, n_values=args.n_values,
+            n_pairs=1, seed=42,
+        )
 
     # max_len must fit the longest document when using whole-doc mode
     if args.whole_doc:
-        max_len = (args.gap_max + 1) * args.chunk_size
+        # Total chunks = 2*n_pairs (store + recall) + (gap_max - 1) fillers
+        max_chunks = 2 * args.n_pairs + args.gap_max - 1
+        max_len = max_chunks * args.chunk_size
         print(f"\n  Whole-doc mode: max_len = {max_len} "
-              f"({args.gap_max + 1} chunks × {args.chunk_size} tokens)")
+              f"({max_chunks} chunks × {args.chunk_size} tokens, "
+              f"{args.n_pairs} pairs)")
     else:
         max_len = args.chunk_size
 
@@ -602,6 +691,8 @@ def main():
         log_every=args.log_every, model_name=model_name,
         whole_doc=args.whole_doc,
         recall_loss_weight=args.recall_loss_weight,
+        recall_only_loss=args.recall_only_loss,
+        curriculum_train_data=curriculum_train_data,
     )
 
     results["config"] = vars(args)
