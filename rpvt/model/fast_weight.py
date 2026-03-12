@@ -79,7 +79,7 @@ class FastWeightMemory(nn.Module):
             self.use_write_gate = write_mode == "gate"
 
         # Surprise-driven write strength (z-score normalized)
-        if write_mode in ("surprise", "surprise-fwd"):
+        if write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
             # Write strength = sigmoid(scale * z + bias)
             # where z = (||error|| - chunk_mean) / (chunk_std + eps)
             # z is computed per-chunk so tokens within the same chunk
@@ -89,6 +89,10 @@ class FastWeightMemory(nn.Module):
             # "surprise-fwd": error = NEXT chunk - M's prediction (forward-looking)
             #   Forward surprise writes strongly when M can't predict what's coming,
             #   forcing M to store forward-predictive content rather than adapter effects.
+            # "surprise-fwd-store": like surprise-fwd, but also stores the NEXT chunk's
+            #   hidden state as the value (instead of current chunk). This makes M a
+            #   transition model: query with current state, retrieve future state.
+            #   Stored content doesn't go stale (unlike storing deltas/errors).
             #
             # scale controls sensitivity: higher = more differentiation
             # bias controls baseline: negative = write less on average
@@ -164,10 +168,11 @@ class FastWeightMemory(nn.Module):
                 v_chunk = v_chunk * ws_chunk
                 write_strength_log.append(ws_chunk.mean().item())
 
-            elif self.write_mode in ("surprise", "surprise-fwd"):
+            elif self.write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
                 # Prediction: what does M think the hidden state should be?
                 prediction = self.W_out(r_chunk)  # (batch, c_len, hidden_size)
 
+                # Determine the target for surprise comparison
                 if self.write_mode == "surprise":
                     # Backward-looking: compare prediction to current chunk
                     actual = x[:, chunk_start:chunk_end, :]  # (batch, c_len, hidden_size)
@@ -181,6 +186,16 @@ class FastWeightMemory(nn.Module):
                     else:
                         # Last chunk: fall back to current chunk
                         actual = x[:, chunk_start:chunk_end, :]
+
+                # For surprise-fwd-store: also store next chunk as the value
+                # This makes M a transition model: query with current → retrieve future
+                if self.write_mode == "surprise-fwd-store":
+                    next_start_v = min(chunk_end, seq_len - c_len)
+                    next_end_v = next_start_v + c_len
+                    if next_end_v <= seq_len and next_start_v != chunk_start:
+                        v_chunk = self.W_value(actual)  # project next chunk's hidden state
+                        v_chunk = F.normalize(v_chunk, dim=-1)
+                    # else: keep v_chunk as current chunk (already set above)
 
                 error = actual - prediction
 

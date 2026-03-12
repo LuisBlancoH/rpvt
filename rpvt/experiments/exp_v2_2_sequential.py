@@ -221,7 +221,7 @@ def get_write_mode_info(model):
                     if isinstance(l, TransformerLayerWithMemory) and l.memory.write_mode == "gate":
                         values.append(torch.sigmoid(l.memory.W_gate.bias).item())
                 return "gate", sum(values) / len(values)
-            elif mem.write_mode in ("surprise", "surprise-fwd"):
+            elif mem.write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
                 return mem.write_mode, (mem.surprise_scale, mem.surprise_bias)
             else:
                 return "uniform", None
@@ -347,7 +347,7 @@ def train_sequential(
 
                 if wm_mode == "gate":
                     extra = f", gate={wm_val:.4f}"
-                elif wm_mode in ("surprise", "surprise-fwd"):
+                elif wm_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
                     extra = f", s={wm_val[0]:.1f}, b={wm_val[1]:.1f}"
                 else:
                     extra = ""

@@ -57,7 +57,7 @@ def main():
                         help="Multiple decay rates to sweep (overrides --decay)")
     parser.add_argument("--write-modes", type=str, nargs="+",
                         default=["uniform", "surprise"],
-                        choices=["uniform", "gate", "surprise", "surprise-fwd"],
+                        choices=["uniform", "gate", "surprise", "surprise-fwd", "surprise-fwd-store"],
                         help="Write modes to compare")
     parser.add_argument("--max-m-norm", type=float, default=10.0,
                         help="Cap on M's Frobenius norm (0 = no cap)")
@@ -132,7 +132,7 @@ def main():
             print(f"  Trainable params: {n_trainable:,}")
 
             # Show surprise hyperparams
-            if write_mode in ("surprise", "surprise-fwd"):
+            if write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
                 mem = memory_modules[0]
                 print(f"  surprise_scale: {mem.surprise_scale:.1f}")
                 print(f"  surprise_bias:  {mem.surprise_bias:.1f}")
