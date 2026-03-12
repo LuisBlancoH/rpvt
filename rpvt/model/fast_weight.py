@@ -48,6 +48,7 @@ class FastWeightMemory(nn.Module):
         aux_predict: bool = False,
         contrastive: bool = False,
         mask_frac: float = 0.0,
+        bptt_steps: int = 0,
         # Legacy compat
         use_write_gate: bool = False,
     ):
@@ -60,6 +61,8 @@ class FastWeightMemory(nn.Module):
         self.aux_predict = aux_predict
         self.contrastive = contrastive
         self.mask_frac = mask_frac
+        self.bptt_steps = bptt_steps  # 0 = always detach (default)
+        self._bptt_counter = 0
 
         # Handle legacy use_write_gate parameter
         if use_write_gate and write_mode == "uniform":
@@ -85,6 +88,12 @@ class FastWeightMemory(nn.Module):
             nn.init.constant_(self.W_gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
         else:
             self.use_write_gate = write_mode == "gate"
+
+        # Predictive memory: W_nudge projects current state for delta computation
+        # output = W_out(retrieved) - W_nudge(x)  → nudge toward predicted state
+        if write_mode == "predictive":
+            self.W_nudge = nn.Linear(hidden_size, hidden_size, bias=False)
+            nn.init.zeros_(self.W_nudge.weight)
 
         # Surprise-driven write strength (z-score normalized)
         if write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
@@ -214,6 +223,15 @@ class FastWeightMemory(nn.Module):
 
             if self.write_mode == "uniform":
                 pass  # no scaling
+
+            elif self.write_mode == "predictive":
+                # Store future states: value = W_value(next_chunk_hidden)
+                next_start = min(chunk_end, seq_len - c_len)
+                next_end = next_start + c_len
+                if next_end <= seq_len and next_start != chunk_start:
+                    future_x = x[:, next_start:next_end, :]
+                    v_chunk = self.W_value(future_x)
+                    v_chunk = F.normalize(v_chunk, dim=-1)
 
             elif self.write_mode == "gate":
                 ws_chunk = gate_strengths[:, chunk_start:chunk_end, :]
@@ -346,11 +364,23 @@ class FastWeightMemory(nn.Module):
                 if m_norm > self.max_m_norm:
                     M = M * (self.max_m_norm / m_norm)
 
-        # Store updated memory (detach — no gradient through memory across calls)
-        self.M = M.detach()
+        # Store updated memory — detach unless BPTT is active
+        if self.bptt_steps > 0 and self._bptt_counter < self.bptt_steps:
+            self.M = M  # keep gradient graph for BPTT
+            self._bptt_counter += 1
+        else:
+            self.M = M.detach()
+            self._bptt_counter = 0
 
         retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
-        output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
+
+        if self.write_mode == "predictive":
+            # Nudge: delta between M's prediction and current state
+            prediction = self.W_out(retrieved)     # predicted future state
+            current = self.W_nudge(x)              # current state representation
+            output = prediction - current          # nudge toward predicted state
+        else:
+            output = self.W_out(retrieved)  # (batch, seq_len, hidden_size)
 
         # Clamp memory output to prevent destabilizing the residual stream.
         # At high decay rates, W_out * (M @ query) can produce outputs large
@@ -409,7 +439,7 @@ class TransformerLayerWithMemory(nn.Module):
     def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
                  decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
                  chunk_agg: str = "token", aux_predict: bool = False, contrastive: bool = False,
-                 mask_frac: float = 0.0, use_write_gate: bool = False):
+                 mask_frac: float = 0.0, bptt_steps: int = 0, use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
         self.mask_frac = mask_frac
@@ -423,6 +453,7 @@ class TransformerLayerWithMemory(nn.Module):
             aux_predict=aux_predict,
             contrastive=contrastive,
             mask_frac=mask_frac,
+            bptt_steps=bptt_steps,
             use_write_gate=use_write_gate,
         )
         # Accumulate aux losses across layers during forward pass
@@ -466,7 +497,7 @@ class TransformerLayerWithMemory(nn.Module):
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
                               write_mode="uniform", max_m_norm=10.0, chunk_agg="token",
                               aux_predict=False, contrastive=False, mask_frac=0.0,
-                              use_write_gate=False):
+                              bptt_steps=0, use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -475,12 +506,13 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
         layer_indices: Which layers to add memory to. None = all.
         memory_size: Dimension of key/value/query projections.
         decay: Memory decay rate per token.
-        write_mode: "uniform", "gate", or "surprise".
+        write_mode: "uniform", "gate", "surprise", or "predictive".
         max_m_norm: Cap on M's Frobenius norm. 0 = no cap.
         chunk_agg: Chunk aggregation method: "token", "mean", "last", "surprise", "learned".
         aux_predict: Enable auxiliary cross-chunk prediction loss.
         contrastive: Enable contrastive loss for document-specific retrieval.
         mask_frac: Fraction of tokens to mask (0 = disabled).
+        bptt_steps: Number of forward calls to keep M in computation graph (0 = always detach).
 
     Returns:
         List of FastWeightMemory modules (for parameter access).
@@ -502,6 +534,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             aux_predict=aux_predict,
             contrastive=contrastive,
             mask_frac=mask_frac,
+            bptt_steps=bptt_steps,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model

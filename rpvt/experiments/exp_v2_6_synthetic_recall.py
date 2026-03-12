@@ -495,9 +495,13 @@ def main():
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--memory-size", type=int, default=128)
     parser.add_argument("--decay", type=float, default=0.99)
-    parser.add_argument("--write-mode", type=str, default="uniform")
+    parser.add_argument("--write-mode", type=str, default="uniform",
+                        choices=["uniform", "gate", "surprise", "surprise-fwd",
+                                 "surprise-fwd-store", "predictive"])
     parser.add_argument("--max-m-norm", type=float, default=0,
                         help="Cap on M norm (0 = no cap)")
+    parser.add_argument("--bptt-steps", type=int, default=0,
+                        help="BPTT steps for M (0 = always detach)")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
@@ -550,7 +554,7 @@ def main():
 
     if not args.no_memory:
         print(f"  Attaching memory (size={args.memory_size}, decay={args.decay}, "
-              f"mode={args.write_mode})")
+              f"mode={args.write_mode}, bptt={args.bptt_steps})")
         memory_modules = attach_fast_weight_memory(
             model.h,
             hidden_size=args.d_model,
@@ -558,6 +562,7 @@ def main():
             decay=args.decay,
             write_mode=args.write_mode,
             max_m_norm=args.max_m_norm,
+            bptt_steps=args.bptt_steps,
         )
     else:
         print("  No memory (baseline)")
