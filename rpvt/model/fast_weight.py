@@ -49,12 +49,14 @@ class FastWeightMemory(nn.Module):
         contrastive: bool = False,
         mask_frac: float = 0.0,
         bptt_steps: int = 0,
+        w_out_std: float = 0.0,
         # Legacy compat
         use_write_gate: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.memory_size = memory_size
+        self.w_out_std = w_out_std
         self.decay = decay
         self.max_m_norm = max_m_norm
         self.chunk_agg = chunk_agg  # "token", "mean", "last", "surprise", "learned"
@@ -75,10 +77,14 @@ class FastWeightMemory(nn.Module):
         self.W_value = nn.Linear(hidden_size, memory_size, bias=False)
 
         # Output projection: memory_size -> hidden_size
-        # Zero-initialized so memory starts with no contribution,
-        # and the model learns to use it through W_out weights directly.
+        # Zero-init: memory starts with no contribution but gradient can't
+        # flow through W_out to M initially (bootstrap problem).
+        # Small random init (w_out_std > 0) allows gradient flow from step 1.
         self.W_out = nn.Linear(memory_size, hidden_size, bias=False)
-        nn.init.zeros_(self.W_out.weight)
+        if w_out_std > 0:
+            nn.init.normal_(self.W_out.weight, std=w_out_std)
+        else:
+            nn.init.zeros_(self.W_out.weight)
 
         # Write gate: learns which tokens are worth writing to M
         if write_mode == "gate":
@@ -444,7 +450,8 @@ class TransformerLayerWithMemory(nn.Module):
     def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
                  decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
                  chunk_agg: str = "token", aux_predict: bool = False, contrastive: bool = False,
-                 mask_frac: float = 0.0, bptt_steps: int = 0, use_write_gate: bool = False):
+                 mask_frac: float = 0.0, bptt_steps: int = 0, w_out_std: float = 0.0,
+                 use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
         self.mask_frac = mask_frac
@@ -459,6 +466,7 @@ class TransformerLayerWithMemory(nn.Module):
             contrastive=contrastive,
             mask_frac=mask_frac,
             bptt_steps=bptt_steps,
+            w_out_std=w_out_std,
             use_write_gate=use_write_gate,
         )
         # Accumulate aux losses across layers during forward pass
@@ -502,7 +510,7 @@ class TransformerLayerWithMemory(nn.Module):
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
                               write_mode="uniform", max_m_norm=10.0, chunk_agg="token",
                               aux_predict=False, contrastive=False, mask_frac=0.0,
-                              bptt_steps=0, use_write_gate=False):
+                              bptt_steps=0, w_out_std=0.0, use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -540,6 +548,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             contrastive=contrastive,
             mask_frac=mask_frac,
             bptt_steps=bptt_steps,
+            w_out_std=w_out_std,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model

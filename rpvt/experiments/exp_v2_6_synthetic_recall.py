@@ -519,6 +519,8 @@ def main():
                         help="Cap on M norm (0 = no cap)")
     parser.add_argument("--bptt-steps", type=int, default=0,
                         help="BPTT steps for M (0 = always detach)")
+    parser.add_argument("--w-out-std", type=float, default=0.0,
+                        help="W_out init std (0 = zero init, >0 = random init for gradient bootstrap)")
     parser.add_argument("--recall-loss-weight", type=float, default=1.0,
                         help="Extra weight on recall token loss (1.0 = uniform, 100 = 100x recall)")
     parser.add_argument("--chunk-size", type=int, default=64)
@@ -573,7 +575,7 @@ def main():
 
     if not args.no_memory:
         print(f"  Attaching memory (size={args.memory_size}, decay={args.decay}, "
-              f"mode={args.write_mode}, bptt={args.bptt_steps})")
+              f"mode={args.write_mode}, bptt={args.bptt_steps}, w_out_std={args.w_out_std})")
         memory_modules = attach_fast_weight_memory(
             model.h,
             hidden_size=args.d_model,
@@ -582,6 +584,7 @@ def main():
             write_mode=args.write_mode,
             max_m_norm=args.max_m_norm,
             bptt_steps=args.bptt_steps,
+            w_out_std=args.w_out_std,
         )
     else:
         print("  No memory (baseline)")
