@@ -89,9 +89,11 @@ class FastWeightMemory(nn.Module):
         else:
             self.use_write_gate = write_mode == "gate"
 
-        # Predictive memory: W_nudge projects current state for delta computation
+        # Predictive/subtract modes: W_nudge projects current state for delta computation
         # output = W_out(retrieved) - W_nudge(x)  → nudge toward predicted state
-        if write_mode == "predictive":
+        # "predictive": future values + subtraction (both changes)
+        # "subtract-only": current values + subtraction (isolates subtraction effect)
+        if write_mode in ("predictive", "subtract-only"):
             self.W_nudge = nn.Linear(hidden_size, hidden_size, bias=False)
             nn.init.zeros_(self.W_nudge.weight)
 
@@ -224,7 +226,7 @@ class FastWeightMemory(nn.Module):
             if self.write_mode == "uniform":
                 pass  # no scaling
 
-            elif self.write_mode == "predictive":
+            elif self.write_mode in ("predictive", "future-only"):
                 # Store future states: value = W_value(next_chunk_hidden)
                 next_start = min(chunk_end, seq_len - c_len)
                 next_end = next_start + c_len
@@ -232,6 +234,9 @@ class FastWeightMemory(nn.Module):
                     future_x = x[:, next_start:next_end, :]
                     v_chunk = self.W_value(future_x)
                     v_chunk = F.normalize(v_chunk, dim=-1)
+
+            elif self.write_mode == "subtract-only":
+                pass  # use current chunk values (same as uniform), subtraction applied at output
 
             elif self.write_mode == "gate":
                 ws_chunk = gate_strengths[:, chunk_start:chunk_end, :]
@@ -374,7 +379,7 @@ class FastWeightMemory(nn.Module):
 
         retrieved = torch.cat(retrieved_chunks, dim=1)  # (batch, seq_len, memory_size)
 
-        if self.write_mode == "predictive":
+        if self.write_mode in ("predictive", "subtract-only"):
             # Nudge: delta between M's prediction and current state
             prediction = self.W_out(retrieved)     # predicted future state
             current = self.W_nudge(x)              # current state representation

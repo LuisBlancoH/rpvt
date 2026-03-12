@@ -513,7 +513,8 @@ def main():
     parser.add_argument("--decay", type=float, default=0.99)
     parser.add_argument("--write-mode", type=str, default="uniform",
                         choices=["uniform", "gate", "surprise", "surprise-fwd",
-                                 "surprise-fwd-store", "predictive"])
+                                 "surprise-fwd-store", "predictive",
+                                 "future-only", "subtract-only"])
     parser.add_argument("--max-m-norm", type=float, default=0,
                         help="Cap on M norm (0 = no cap)")
     parser.add_argument("--bptt-steps", type=int, default=0,
