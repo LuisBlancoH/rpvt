@@ -228,10 +228,28 @@ def get_write_mode_info(model):
     return None, None
 
 
+def collect_aux_losses(model):
+    """Collect auxiliary losses from all memory layers."""
+    total = {}
+    count = 0
+    for layer in model.transformer.h:
+        if isinstance(layer, TransformerLayerWithMemory) and layer._aux_losses:
+            for key, val in layer._aux_losses.items():
+                if key not in total:
+                    total[key] = val
+                else:
+                    total[key] = total[key] + val
+            count += 1
+    if count > 0:
+        total = {k: v / count for k, v in total.items()}
+    return total
+
+
 def train_sequential(
     model, dataset, device,
     num_epochs=3, lr=9e-4, warmup_steps=200,
     log_every=100, batch_size=1, model_name="model",
+    aux_weight=0.0, contrastive_weight=0.0,
 ):
     """Train on sequential data with document-aware memory management.
 
@@ -280,6 +298,16 @@ def train_sequential(
 
             outputs = model(input_ids, labels=input_ids)
             loss = outputs.loss
+
+            # ── Collect and add auxiliary losses ──
+            aux_losses = collect_aux_losses(model)
+            aux_loss_total = 0.0
+            if "aux_predict" in aux_losses and aux_weight > 0:
+                loss = loss + aux_weight * aux_losses["aux_predict"]
+                aux_loss_total += aux_losses["aux_predict"].item()
+            if "contrastive" in aux_losses and contrastive_weight > 0:
+                loss = loss + contrastive_weight * aux_losses["contrastive"]
+                aux_loss_total += aux_losses["contrastive"].item()
 
             # ── NaN detection: enable debug mode and re-run to trace origin ──
             if torch.isnan(loss) or torch.isinf(loss):

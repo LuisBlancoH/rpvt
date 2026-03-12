@@ -65,6 +65,12 @@ def main():
                         default=["token"],
                         choices=["token", "mean", "last", "surprise", "learned"],
                         help="Chunk aggregation methods to compare")
+    parser.add_argument("--aux-weight", type=float, default=0.0,
+                        help="Weight for auxiliary cross-chunk prediction loss (0 = disabled)")
+    parser.add_argument("--contrastive-weight", type=float, default=0.0,
+                        help="Weight for contrastive loss (0 = disabled)")
+    parser.add_argument("--mask-frac", type=float, default=0.0,
+                        help="Fraction of tokens to mask per layer (0 = disabled)")
     parser.add_argument("--lr", type=float, default=9e-4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -119,9 +125,23 @@ def main():
                     print(f"\n  Skipping chunk_agg=surprise with write_mode={write_mode} (no surprise scores)")
                     continue
 
+                # Build run key with aux loss info
+                aux_tags = []
+                if args.aux_weight > 0:
+                    aux_tags.append(f"aux={args.aux_weight}")
+                if args.contrastive_weight > 0:
+                    aux_tags.append(f"ctr={args.contrastive_weight}")
+                if args.mask_frac > 0:
+                    aux_tags.append(f"mask={args.mask_frac}")
+                aux_str = "_".join(aux_tags)
                 run_key = f"decay={decay}_mode={write_mode}_agg={chunk_agg}"
+                if aux_str:
+                    run_key += f"_{aux_str}"
+
                 print(f"\n{'='*60}")
                 print(f"DECAY = {decay}, WRITE MODE = {write_mode}, CHUNK AGG = {chunk_agg}")
+                if aux_tags:
+                    print(f"  AUX: {', '.join(aux_tags)}")
                 print(f"{'='*60}")
 
                 # Build fresh model
@@ -137,6 +157,9 @@ def main():
                     write_mode=write_mode,
                     max_m_norm=args.max_m_norm,
                     chunk_agg=chunk_agg,
+                    aux_predict=args.aux_weight > 0,
+                    contrastive=args.contrastive_weight > 0,
+                    mask_frac=args.mask_frac,
                 )
 
                 n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -154,6 +177,8 @@ def main():
                     num_epochs=args.epochs, lr=args.lr,
                     warmup_steps=200, log_every=args.log_every,
                     model_name=run_key,
+                    aux_weight=args.aux_weight,
+                    contrastive_weight=args.contrastive_weight,
                 )
 
                 # Evaluate by position

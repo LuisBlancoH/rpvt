@@ -45,6 +45,9 @@ class FastWeightMemory(nn.Module):
         write_mode: str = "uniform",
         max_m_norm: float = 10.0,
         chunk_agg: str = "token",
+        aux_predict: bool = False,
+        contrastive: bool = False,
+        mask_frac: float = 0.0,
         # Legacy compat
         use_write_gate: bool = False,
     ):
@@ -54,6 +57,9 @@ class FastWeightMemory(nn.Module):
         self.decay = decay
         self.max_m_norm = max_m_norm
         self.chunk_agg = chunk_agg  # "token", "mean", "last", "surprise", "learned"
+        self.aux_predict = aux_predict
+        self.contrastive = contrastive
+        self.mask_frac = mask_frac
 
         # Handle legacy use_write_gate parameter
         if use_write_gate and write_mode == "uniform":
@@ -107,6 +113,16 @@ class FastWeightMemory(nn.Module):
             nn.init.zeros_(self.W_agg_score.weight)
             nn.init.zeros_(self.W_agg_score.bias)
 
+        # Auxiliary cross-chunk prediction head
+        if aux_predict:
+            self.W_aux_pred = nn.Linear(memory_size, hidden_size, bias=False)
+            nn.init.zeros_(self.W_aux_pred.weight)
+
+        # Contrastive projection (maps retrieval to a space for similarity)
+        if contrastive:
+            self.W_contrast = nn.Linear(memory_size, memory_size, bias=False)
+            nn.init.normal_(self.W_contrast.weight, std=0.02)
+
         # NaN debugging flag — set to True to enable per-chunk NaN tracing
         self._nan_debug = False
 
@@ -117,7 +133,7 @@ class FastWeightMemory(nn.Module):
         """Reset memory to zero."""
         self.M.zero_()
 
-    def forward(self, x: torch.Tensor, chunk_size: int = 64) -> tuple[torch.Tensor, float | None]:
+    def forward(self, x: torch.Tensor, chunk_size: int = 64) -> tuple[torch.Tensor, float | None, dict]:
         """Process a sequence in chunks, updating memory between chunks.
 
         Within each chunk, all tokens read from the same M state (beginning of chunk).
@@ -130,6 +146,7 @@ class FastWeightMemory(nn.Module):
         Returns:
             output: (batch, seq_len, hidden_size) — memory output to add to residual
             mean_ws: mean write strength for logging (None if uniform)
+            aux_losses: dict of auxiliary losses (empty if none enabled)
         """
         batch, seq_len, _ = x.shape
 
@@ -147,6 +164,9 @@ class FastWeightMemory(nn.Module):
 
         retrieved_chunks = []
         write_strength_log = []
+        aux_pred_losses = []
+        contrastive_anchors = []
+        contrastive_targets = []
         M = self.M.clone()  # (memory_size, memory_size)
 
         for chunk_start in range(0, seq_len, chunk_size):
@@ -162,6 +182,31 @@ class FastWeightMemory(nn.Module):
             if self._nan_debug and (torch.isnan(r_chunk).any() or torch.isinf(r_chunk).any()):
                 print(f"[NaN DEBUG] r_chunk has nan/inf at chunk_start={chunk_start}, "
                       f"M_norm={M.norm().item():.4f}, q_norm={q_chunk.norm().item():.4f}")
+
+            # ── AUX: cross-chunk prediction loss ──
+            if self.aux_predict and chunk_end < seq_len:
+                next_start = chunk_end
+                next_end = min(next_start + c_len, seq_len)
+                if next_end > next_start:
+                    r_mean = r_chunk.mean(dim=1)  # (batch, memory_size)
+                    pred_next = self.W_aux_pred(r_mean)  # (batch, hidden_size)
+                    actual_next = x[:, next_start:next_end, :].mean(dim=1).detach()
+                    aux_pred_losses.append(F.mse_loss(pred_next, actual_next))
+
+            # ── AUX: contrastive anchors ──
+            if self.contrastive:
+                r_proj = self.W_contrast(r_chunk.mean(dim=1))  # (batch, memory_size)
+                r_proj = F.normalize(r_proj, dim=-1)
+                contrastive_anchors.append(r_proj)
+                # Target: next chunk's actual hidden state projected to same space
+                if chunk_end < seq_len:
+                    next_start = chunk_end
+                    next_end = min(next_start + c_len, seq_len)
+                    actual_mean = x[:, next_start:next_end, :].mean(dim=1).detach()
+                    target_proj = F.normalize(self.W_contrast(self.W_query(actual_mean)), dim=-1)
+                    contrastive_targets.append(target_proj)
+                else:
+                    contrastive_targets.append(None)
 
             # ── COMPUTE WRITE STRENGTH ──
             k_chunk = key[:, chunk_start:chunk_end, :]     # (batch, c_len, memory_size)
@@ -314,8 +359,41 @@ class FastWeightMemory(nn.Module):
         output_norm = output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         output = output * (max_output_norm / output_norm).clamp(max=1.0)
 
+        # ── Compute auxiliary losses ──
+        aux_losses = {}
+
+        if aux_pred_losses:
+            aux_losses["aux_predict"] = sum(aux_pred_losses) / len(aux_pred_losses)
+
+        if contrastive_anchors and len(contrastive_anchors) > 1:
+            # InfoNCE-style: for each chunk i, retrieval should be similar to
+            # next chunk (positive) and dissimilar to other chunks (negatives)
+            c_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+            n_pairs = 0
+            temperature = 0.1
+            for i in range(len(contrastive_anchors) - 1):
+                if contrastive_targets[i] is None:
+                    continue
+                anchor = contrastive_anchors[i]  # (batch, memory_size)
+                positive = contrastive_targets[i]  # (batch, memory_size)
+                # Negatives: all other anchors
+                neg_indices = [j for j in range(len(contrastive_anchors)) if j != i]
+                if not neg_indices:
+                    continue
+                negatives = torch.stack([contrastive_anchors[j] for j in neg_indices], dim=1)
+                # (batch, n_neg, memory_size)
+                pos_sim = (anchor * positive).sum(dim=-1) / temperature  # (batch,)
+                neg_sim = torch.einsum("bd,bnd->bn", anchor, negatives) / temperature
+                # (batch, n_neg)
+                logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # (batch, 1+n_neg)
+                labels = torch.zeros(batch, device=x.device, dtype=torch.long)
+                c_loss = c_loss + F.cross_entropy(logits.float(), labels)
+                n_pairs += 1
+            if n_pairs > 0:
+                aux_losses["contrastive"] = c_loss / n_pairs
+
         mean_ws = sum(write_strength_log) / len(write_strength_log) if write_strength_log else None
-        return output, mean_ws
+        return output, mean_ws, aux_losses
 
 
 class TransformerLayerWithMemory(nn.Module):
@@ -330,9 +408,11 @@ class TransformerLayerWithMemory(nn.Module):
 
     def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
                  decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
-                 chunk_agg: str = "token", use_write_gate: bool = False):
+                 chunk_agg: str = "token", aux_predict: bool = False, contrastive: bool = False,
+                 mask_frac: float = 0.0, use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
+        self.mask_frac = mask_frac
         self.memory = FastWeightMemory(
             hidden_size=hidden_size,
             memory_size=memory_size,
@@ -340,8 +420,13 @@ class TransformerLayerWithMemory(nn.Module):
             write_mode=write_mode,
             max_m_norm=max_m_norm,
             chunk_agg=chunk_agg,
+            aux_predict=aux_predict,
+            contrastive=contrastive,
+            mask_frac=mask_frac,
             use_write_gate=use_write_gate,
         )
+        # Accumulate aux losses across layers during forward pass
+        self._aux_losses = {}
 
     def forward(self, *args, **kwargs):
         """Run the original layer, then add memory output."""
@@ -355,10 +440,18 @@ class TransformerLayerWithMemory(nn.Module):
             hidden_states = outputs
 
         # Read from and write to memory
-        memory_output, gate_value = self.memory(hidden_states)
+        memory_output, gate_value, aux_losses = self.memory(hidden_states)
+        self._aux_losses = aux_losses
 
-        # Add memory output to hidden states
-        modified = hidden_states + memory_output
+        # Masking: for a fraction of tokens, zero out transformer hidden states
+        # so that only M's output contributes. Forces M to carry cross-chunk info.
+        if self.mask_frac > 0 and self.training:
+            batch, seq_len = hidden_states.shape[:2]
+            mask = (torch.rand(batch, seq_len, 1, device=hidden_states.device) < self.mask_frac)
+            mask = mask.to(hidden_states.dtype)
+            modified = hidden_states * (1 - mask) + memory_output
+        else:
+            modified = hidden_states + memory_output
 
         # Return in same format as original layer
         if isinstance(outputs, tuple):
@@ -372,6 +465,7 @@ class TransformerLayerWithMemory(nn.Module):
 
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
                               write_mode="uniform", max_m_norm=10.0, chunk_agg="token",
+                              aux_predict=False, contrastive=False, mask_frac=0.0,
                               use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
@@ -384,6 +478,9 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
         write_mode: "uniform", "gate", or "surprise".
         max_m_norm: Cap on M's Frobenius norm. 0 = no cap.
         chunk_agg: Chunk aggregation method: "token", "mean", "last", "surprise", "learned".
+        aux_predict: Enable auxiliary cross-chunk prediction loss.
+        contrastive: Enable contrastive loss for document-specific retrieval.
+        mask_frac: Fraction of tokens to mask (0 = disabled).
 
     Returns:
         List of FastWeightMemory modules (for parameter access).
@@ -402,6 +499,9 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             write_mode=write_mode,
             max_m_norm=max_m_norm,
             chunk_agg=chunk_agg,
+            aux_predict=aux_predict,
+            contrastive=contrastive,
+            mask_frac=mask_frac,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model
