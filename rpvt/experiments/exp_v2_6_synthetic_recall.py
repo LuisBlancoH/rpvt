@@ -233,12 +233,16 @@ def reset_memories(model):
 def train_and_eval(
     model, train_dataset, eval_dataset, device,
     num_epochs=10, lr=1e-3, log_every=50, model_name="model",
-    whole_doc=False,
+    whole_doc=False, recall_loss_weight=1.0,
 ):
     """Train and evaluate.
 
     If whole_doc=True, feed entire documents as single sequences so gradient
     flows through M across all chunks. This lets M learn what to store.
+
+    recall_loss_weight: multiply the loss at the recall position by this factor.
+    Default 1.0 = uniform weighting. Higher values (e.g. 100) amplify the
+    recall signal so it doesn't get buried by filler token predictions.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
@@ -270,7 +274,19 @@ def train_and_eval(
                 reset_memories(model)
 
                 output = model(input_ids, labels=input_ids)
-                loss = output.loss
+
+                if recall_loss_weight > 1.0:
+                    # Recompute loss with extra weight on the recall position
+                    # Position -2 in logits predicts position -1 in labels (the value token)
+                    logits = output.logits[:, :-1].reshape(-1, output.logits.size(-1))
+                    targets = input_ids[:, 1:].reshape(-1)
+                    per_token_loss = F.cross_entropy(logits, targets, reduction='none')
+                    # Weight: all tokens get 1.0, recall position gets extra
+                    weights = torch.ones_like(per_token_loss)
+                    weights[-1] = recall_loss_weight  # last prediction = recall
+                    loss = (per_token_loss * weights).sum() / weights.sum()
+                else:
+                    loss = output.loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -502,6 +518,8 @@ def main():
                         help="Cap on M norm (0 = no cap)")
     parser.add_argument("--bptt-steps", type=int, default=0,
                         help="BPTT steps for M (0 = always detach)")
+    parser.add_argument("--recall-loss-weight", type=float, default=1.0,
+                        help="Extra weight on recall token loss (1.0 = uniform, 100 = 100x recall)")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
@@ -579,6 +597,7 @@ def main():
         num_epochs=args.epochs, lr=args.lr,
         log_every=args.log_every, model_name=model_name,
         whole_doc=args.whole_doc,
+        recall_loss_weight=args.recall_loss_weight,
     )
 
     results["config"] = vars(args)
