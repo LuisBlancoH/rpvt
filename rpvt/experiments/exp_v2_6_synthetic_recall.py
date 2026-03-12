@@ -129,6 +129,16 @@ class SyntheticRecallDataset(Dataset):
                     doc["value_id"] if is_recall_chunk else -1
                 )
 
+        # Also build whole-document sequences (concatenated chunks)
+        self.doc_sequences = []  # list of (input_ids_tensor, value_id, gap)
+        for doc in self.documents:
+            seq = torch.cat(doc["chunks"])  # (n_chunks * chunk_size,)
+            self.doc_sequences.append({
+                "input_ids": seq,
+                "value_id": doc["value_id"],
+                "gap": doc["gap"],
+            })
+
         print(f"  SyntheticRecall: {n_docs} docs, {len(self.all_chunks)} chunks, "
               f"gap range {gap_range}, {n_keys} keys, {n_values} values, "
               f"vocab size {self.vocab_size}")
@@ -223,11 +233,19 @@ def reset_memories(model):
 def train_and_eval(
     model, train_dataset, eval_dataset, device,
     num_epochs=10, lr=1e-3, log_every=50, model_name="model",
+    whole_doc=False,
 ):
+    """Train and evaluate.
+
+    If whole_doc=True, feed entire documents as single sequences so gradient
+    flows through M across all chunks. This lets M learn what to store.
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False,
-                              collate_fn=recall_collate_fn)
-    total_steps = len(train_loader) * num_epochs
+
+    if whole_doc:
+        total_steps = len(train_dataset.doc_sequences) * num_epochs
+    else:
+        total_steps = len(train_dataset.all_chunks) * num_epochs
 
     def lr_schedule(step):
         warmup = 100
@@ -238,43 +256,74 @@ def train_and_eval(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
-    print(f"\nTraining {model_name}: {total_steps} steps")
+    print(f"\nTraining {model_name}: {total_steps} steps, whole_doc={whole_doc}")
     model.train()
     global_step = 0
     train_losses = []
     start_time = time.time()
-    prev_doc_id = None
 
     for epoch in range(num_epochs):
-        for batch in train_loader:
-            input_ids = batch["input_ids"].to(device)
-            doc_ids = batch["doc_ids"]
-            is_first = batch["is_first"]
-
-            if any(is_first) or (prev_doc_id is not None and doc_ids[0] != prev_doc_id):
+        if whole_doc:
+            # Feed entire documents as single sequences
+            for doc in train_dataset.doc_sequences:
+                input_ids = doc["input_ids"].unsqueeze(0).to(device)  # (1, n_chunks*chunk_size)
                 reset_memories(model)
-            prev_doc_id = doc_ids[0]
 
-            output = model(input_ids, labels=input_ids)
-            loss = output.loss
+                output = model(input_ids, labels=input_ids)
+                loss = output.loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
 
-            train_losses.append(loss.item())
-            global_step += 1
+                train_losses.append(loss.item())
+                global_step += 1
 
-            if global_step % log_every == 0:
-                avg_loss = sum(train_losses[-log_every:]) / log_every
-                elapsed = time.time() - start_time
-                print(f"  [{model_name}] step {global_step}/{total_steps}, "
-                      f"loss={avg_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}, "
-                      f"{elapsed:.0f}s")
+                if global_step % log_every == 0:
+                    avg_loss = sum(train_losses[-log_every:]) / log_every
+                    elapsed = time.time() - start_time
+                    print(f"  [{model_name}] step {global_step}/{total_steps}, "
+                          f"loss={avg_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}, "
+                          f"{elapsed:.0f}s")
+        else:
+            # Feed individual chunks (original behavior)
+            train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False,
+                                      collate_fn=recall_collate_fn)
+            prev_doc_id = None
+            for batch in train_loader:
+                input_ids = batch["input_ids"].to(device)
+                doc_ids = batch["doc_ids"]
+                is_first = batch["is_first"]
 
-    return evaluate_recall(model, eval_dataset, device, model_name)
+                if any(is_first) or (prev_doc_id is not None and doc_ids[0] != prev_doc_id):
+                    reset_memories(model)
+                prev_doc_id = doc_ids[0]
+
+                output = model(input_ids, labels=input_ids)
+                loss = output.loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+
+                train_losses.append(loss.item())
+                global_step += 1
+
+                if global_step % log_every == 0:
+                    avg_loss = sum(train_losses[-log_every:]) / log_every
+                    elapsed = time.time() - start_time
+                    print(f"  [{model_name}] step {global_step}/{total_steps}, "
+                          f"loss={avg_loss:.4f}, lr={scheduler.get_last_lr()[0]:.2e}, "
+                          f"{elapsed:.0f}s")
+
+    if whole_doc:
+        return evaluate_recall_whole_doc(model, eval_dataset, device, model_name)
+    else:
+        return evaluate_recall(model, eval_dataset, device, model_name)
 
 
 def evaluate_recall(model, dataset, device, model_name="model"):
@@ -319,6 +368,58 @@ def evaluate_recall(model, dataset, device, model_name="model"):
                 gap = doc["gap"]
                 correct_by_gap[gap] = correct_by_gap.get(gap, 0) + (1 if predicted == value_token else 0)
                 total_by_gap[gap] = total_by_gap.get(gap, 0) + 1
+
+    accuracy = correct / max(total, 1)
+    print(f"\n  [{model_name}] Recall accuracy: {correct}/{total} = {accuracy:.1%}")
+
+    if total_by_gap:
+        print(f"\n  {'Gap':>5} | {'Correct':>8} | {'Total':>6} | {'Accuracy':>8}")
+        print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*6}-+-{'-'*8}")
+        for gap in sorted(total_by_gap):
+            acc = correct_by_gap.get(gap, 0) / total_by_gap[gap]
+            print(f"  {gap:>5} | {correct_by_gap.get(gap, 0):>8} | {total_by_gap[gap]:>6} | {acc:>7.1%}")
+
+    accuracy_by_gap = {
+        gap: correct_by_gap.get(gap, 0) / total_by_gap[gap]
+        for gap in sorted(total_by_gap)
+    }
+
+    return {
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "accuracy_by_gap": accuracy_by_gap,
+    }
+
+
+def evaluate_recall_whole_doc(model, dataset, device, model_name="model"):
+    """Evaluate recall by feeding whole documents."""
+    model.eval()
+
+    correct = 0
+    total = 0
+    correct_by_gap = {}
+    total_by_gap = {}
+
+    with torch.no_grad():
+        for doc in dataset.doc_sequences:
+            input_ids = doc["input_ids"].unsqueeze(0).to(device)
+            reset_memories(model)
+
+            output = model(input_ids, labels=input_ids)
+
+            # The value token is at position -1, so logits at -2 predict it
+            logits = output.logits[0, -2, :]
+            value_token = dataset.value_offset + doc["value_id"]
+            predicted = logits.argmax().item()
+
+            if predicted == value_token:
+                correct += 1
+            total += 1
+
+            gap = doc["gap"]
+            correct_by_gap[gap] = correct_by_gap.get(gap, 0) + (1 if predicted == value_token else 0)
+            total_by_gap[gap] = total_by_gap.get(gap, 0) + 1
 
     accuracy = correct / max(total, 1)
     print(f"\n  [{model_name}] Recall accuracy: {correct}/{total} = {accuracy:.1%}")
@@ -411,6 +512,8 @@ def main():
     parser.add_argument("--output-dir", default="results/exp_v2_6_recall")
     parser.add_argument("--no-memory", action="store_true",
                         help="Run without memory (baseline)")
+    parser.add_argument("--whole-doc", action="store_true",
+                        help="Feed whole documents as single sequences (enables gradient flow through M)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -428,13 +531,21 @@ def main():
         seed=1337,
     )
 
+    # max_len must fit the longest document when using whole-doc mode
+    if args.whole_doc:
+        max_len = (args.gap_max + 1) * args.chunk_size
+        print(f"\n  Whole-doc mode: max_len = {max_len} "
+              f"({args.gap_max + 1} chunks × {args.chunk_size} tokens)")
+    else:
+        max_len = args.chunk_size
+
     print(f"\nBuilding model (d={args.d_model}, L={args.n_layers}, H={args.n_heads})...")
     model = SmallTransformerLM(
         vocab_size=train_data.vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        max_len=args.chunk_size,
+        max_len=max_len,
     ).to(device)
 
     if not args.no_memory:
@@ -456,15 +567,19 @@ def main():
     print(f"  Total params: {n_params:,}, trainable: {n_trainable:,}")
 
     model_name = "no_memory" if args.no_memory else f"memory_d={args.decay}_{args.write_mode}"
+    if args.whole_doc:
+        model_name += "_wholedoc"
     results = train_and_eval(
         model, train_data, eval_data, device,
         num_epochs=args.epochs, lr=args.lr,
         log_every=args.log_every, model_name=model_name,
+        whole_doc=args.whole_doc,
     )
 
     results["config"] = vars(args)
 
-    if not args.no_memory:
+    if not args.no_memory and not args.whole_doc:
+        # Chunk-based ablation: reset M before every chunk
         print(f"\n  Testing with memory reset before every chunk...")
         reset_results = evaluate_recall_no_memory(model, eval_data, device)
         results["no_memory_accuracy"] = reset_results["accuracy"]
