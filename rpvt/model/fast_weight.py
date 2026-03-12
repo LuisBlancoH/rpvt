@@ -50,6 +50,9 @@ class FastWeightMemory(nn.Module):
         mask_frac: float = 0.0,
         bptt_steps: int = 0,
         w_out_std: float = 0.0,
+        tie_qk: bool = False,
+        delta_rule: bool = False,
+        gate_bias: float = -2.0,
         # Legacy compat
         use_write_gate: bool = False,
     ):
@@ -65,6 +68,8 @@ class FastWeightMemory(nn.Module):
         self.mask_frac = mask_frac
         self.bptt_steps = bptt_steps  # 0 = always detach (default)
         self._bptt_counter = 0
+        self.tie_qk = tie_qk
+        self.delta_rule = delta_rule
 
         # Handle legacy use_write_gate parameter
         if use_write_gate and write_mode == "uniform":
@@ -72,8 +77,13 @@ class FastWeightMemory(nn.Module):
         self.write_mode = write_mode
 
         # Projections: hidden_size -> memory_size
-        self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
         self.W_key = nn.Linear(hidden_size, memory_size, bias=False)
+        if tie_qk:
+            # Tie W_query = W_key: same key token produces same vector
+            # for both storage and retrieval, guaranteeing key-query matching
+            self.W_query = self.W_key
+        else:
+            self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
         self.W_value = nn.Linear(hidden_size, memory_size, bias=False)
 
         # Output projection: memory_size -> hidden_size
@@ -91,7 +101,7 @@ class FastWeightMemory(nn.Module):
             self.use_write_gate = True  # legacy compat
             self.W_gate = nn.Linear(hidden_size, 1, bias=True)
             nn.init.zeros_(self.W_gate.weight)
-            nn.init.constant_(self.W_gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+            nn.init.constant_(self.W_gate.bias, gate_bias)  # sigmoid(-2)≈0.12, sigmoid(-5)≈0.007
         else:
             self.use_write_gate = write_mode == "gate"
 
@@ -324,6 +334,13 @@ class FastWeightMemory(nn.Module):
                 v_chunk = v_chunk * ws_chunk
                 write_strength_log.append(ws_chunk.mean().item())
 
+            # ── DELTA RULE: replace old association before writing ──
+            if self.delta_rule:
+                # v_new = v - M^T @ k (subtract what M already associates with this key)
+                # This turns M into a dictionary (overwrite) instead of a pile (accumulate)
+                old_v = torch.matmul(k_chunk, M.T)  # (batch, c_len, memory_size) — what M returns for these keys
+                v_chunk = v_chunk - old_v
+
             # ── WRITE ──
             if self.chunk_agg == "token":
                 # Token-level: sum of outer products (original behavior)
@@ -451,6 +468,7 @@ class TransformerLayerWithMemory(nn.Module):
                  decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
                  chunk_agg: str = "token", aux_predict: bool = False, contrastive: bool = False,
                  mask_frac: float = 0.0, bptt_steps: int = 0, w_out_std: float = 0.0,
+                 tie_qk: bool = False, delta_rule: bool = False, gate_bias: float = -2.0,
                  use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
@@ -467,6 +485,9 @@ class TransformerLayerWithMemory(nn.Module):
             mask_frac=mask_frac,
             bptt_steps=bptt_steps,
             w_out_std=w_out_std,
+            tie_qk=tie_qk,
+            delta_rule=delta_rule,
+            gate_bias=gate_bias,
             use_write_gate=use_write_gate,
         )
         # Accumulate aux losses across layers during forward pass
@@ -510,7 +531,8 @@ class TransformerLayerWithMemory(nn.Module):
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
                               write_mode="uniform", max_m_norm=10.0, chunk_agg="token",
                               aux_predict=False, contrastive=False, mask_frac=0.0,
-                              bptt_steps=0, w_out_std=0.0, use_write_gate=False):
+                              bptt_steps=0, w_out_std=0.0, tie_qk=False, delta_rule=False,
+                              gate_bias=-2.0, use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -549,6 +571,9 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             mask_frac=mask_frac,
             bptt_steps=bptt_steps,
             w_out_std=w_out_std,
+            tie_qk=tie_qk,
+            delta_rule=delta_rule,
+            gate_bias=gate_bias,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model

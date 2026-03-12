@@ -591,6 +591,12 @@ def main():
                         help="BPTT steps for M (0 = always detach)")
     parser.add_argument("--w-out-std", type=float, default=0.0,
                         help="W_out init std (0 = zero init, >0 = random init for gradient bootstrap)")
+    parser.add_argument("--tie-qk", action="store_true",
+                        help="Tie W_query = W_key for guaranteed key-query matching")
+    parser.add_argument("--delta-rule", action="store_true",
+                        help="Use delta update rule: M += k⊗(v - Mk) to reduce interference")
+    parser.add_argument("--gate-bias", type=float, default=-2.0,
+                        help="Gate bias init (sigmoid(-2)=0.12, sigmoid(-5)=0.007)")
     parser.add_argument("--recall-loss-weight", type=float, default=1.0,
                         help="Extra weight on recall token loss (1.0 = uniform, 100 = 100x recall)")
     parser.add_argument("--recall-only-loss", action="store_true",
@@ -663,8 +669,13 @@ def main():
     ).to(device)
 
     if not args.no_memory:
+        extras = []
+        if args.tie_qk: extras.append("tie_qk")
+        if args.delta_rule: extras.append("delta")
+        if args.gate_bias != -2.0: extras.append(f"gate_bias={args.gate_bias}")
         print(f"  Attaching memory (size={args.memory_size}, decay={args.decay}, "
-              f"mode={args.write_mode}, bptt={args.bptt_steps}, w_out_std={args.w_out_std})")
+              f"mode={args.write_mode}, bptt={args.bptt_steps}, w_out_std={args.w_out_std}"
+              f"{', ' + ', '.join(extras) if extras else ''})")
         memory_modules = attach_fast_weight_memory(
             model.h,
             hidden_size=args.d_model,
@@ -674,6 +685,9 @@ def main():
             max_m_norm=args.max_m_norm,
             bptt_steps=args.bptt_steps,
             w_out_std=args.w_out_std,
+            tie_qk=args.tie_qk,
+            delta_rule=args.delta_rule,
+            gate_bias=args.gate_bias,
         )
     else:
         print("  No memory (baseline)")
