@@ -23,54 +23,52 @@ The model will memorize key→value mappings in weights if the pair space is sma
 | 64 keys × 128 values | 8,192 | 2,000 | **22%** | No — most eval pairs novel |
 | 64 keys × 256 values | 16,384 | 2,000 | ~11% | No |
 
-The 128v predictive M result (100%) is **confirmed real retrieval** — only 22% of eval pairs appeared in training. The model generalized to 78% unseen pairs.
+### Key Discovery 3: The 100% Predictive Result Was a Fluke
+
+The predictive M 100% result (128v, gap 5-20, decay 0.999) **did not reproduce**. Rerun with identical config gave 1.2% (chance). The original run was a lucky seed.
+
+### Ablation Results (all decay 0.999, 128v, gap 5-20)
+
+| Ablation | Values stored | Output | Recall |
+|----------|-------------|--------|--------|
+| A: Regular (uniform) | current chunk | additive | 0% |
+| B: Future-only | next chunk | additive | 0.2% |
+| C: Subtract-only | current chunk | delta (pred - current) | 0.4% |
+| D: Predictive (both) | next chunk | delta | 1.2% |
+| D (original, non-reproducible) | next chunk | delta | ~~100%~~ |
+
+**Conclusion**: No memory mode achieves reliable retrieval. Neither future values nor subtraction nor their combination works. The recall signal is too diluted in the loss (~1/1344 of total gradient).
 
 ### Controlled Results (all decay 0.999)
 
-| Config | No Memory | Regular M (uniform) | Predictive M (nudge) |
-|--------|-----------|---------------------|----------------------|
-| 64v, gap 2-8 (2048 pairs) | 2.0% | 1.6% | 0.8% |
-| 128v, gap 5-20 (8192 pairs) | — | 0.2% | **100%** |
+| Config | No Memory | Regular M | Predictive M |
+|--------|-----------|-----------|-------------|
+| 64v, gap 2-8 | 2.0% | 1.6% | 0.8% |
+| 128v, gap 5-20 | — | 0.2% | 1.2% |
 
-At 64v: all modes fail because pair space is small enough to attempt memorization, but decay 0.999 M interferes with it. The task becomes a conflict between two learning strategies.
+All at chance level. M provides no benefit over no-memory baseline.
 
-At 128v: memorization is impossible (too many pairs). Regular M fails. **Predictive M succeeds** — the only configuration that achieves real retrieval.
+### Loss Dilution Problem (root cause)
 
-### Predictive M (nudge) vs Regular M
+The recall token is 1 out of N tokens in the sequence. With uniform loss weighting, the recall gradient is ~1/N of total. For a 1344-token sequence (gap 20), the recall signal is 0.07% of the gradient.
 
-Predictive mode: `output = W_out(M @ query) - W_nudge(x)` (delta toward predicted state)
-Regular mode: `output = W_out(M @ query)` (additive)
+The model spends all capacity learning to predict random filler tokens (fixed entropy ~5.5) and gets negligible gradient from the one recall token that matters.
 
-Predictive M also stores future states: `value = W_value(next_chunk_hidden)`.
+Added `--recall-loss-weight` flag to amplify recall signal. **Not yet tested.**
 
-On the medium task (128 values, gap 5-20, decay 0.999):
-- Regular M: 0.2% (chance)
-- Predictive M: **100%** (verified not memorization — 78% of eval pairs unseen in training)
+### Reproducibility Issues
 
-### Why Predictive Works (hypotheses, not yet tested)
+- No-memory baseline: 24% in one run, 2% in another (same config, different random init)
+- Predictive M: 100% in one run, 1.2% in rerun (same config)
 
-1. **Richer stored values**: future states contain attention-processed info from the store chunk
-2. **Stronger gradient signal**: the subtraction creates a direct comparison forcing M to be useful
-3. **Extra parameters**: W_nudge (256×256 per layer = 262K extra) may provide better learning landscape
-4. **Architecture prevents ignoring M**: delta output can't be trivially zeroed like additive output
-
-### Invalidated Results (decay 0.99, M was dead)
-
-| Config | Regular M | Predictive M |
-|--------|-----------|-------------|
-| 64v, gap 2-8 | 100% (memorized) | 100% (memorized) |
-| 256v, gap 2-8 | 0.2% (M dead, can't memorize) | 0.2% (same) |
-
-### Loss Dilution Problem
-
-The recall token is 1 out of N tokens in the sequence. With uniform loss weighting, the recall gradient is ~1/N of total. Added `--recall-loss-weight` flag to amplify recall signal. Not yet tested in clean sweep.
+Single runs are unreliable. Need multiple seeds per config.
 
 ### Open Questions
 
-1. Why does predictive mode work when regular doesn't? (need ablations: subtraction only, future values only, extra params only)
-2. Does recall-weighted loss fix regular M?
-3. Does predictive M hold up at longer gaps (10-40)?
-4. Reproducibility: need multiple seeds per config (no-memory baseline varied 2% to 24% across runs)
+1. Does recall-weighted loss (e.g. 100x) enable any mode to learn retrieval?
+2. If weighted loss works, does it work for regular M too, or only predictive?
+3. Should we compute loss ONLY on the recall position?
+4. Need 3+ seeds per config for reliable results
 
 ---
 *Last updated: 2026-03-12*
