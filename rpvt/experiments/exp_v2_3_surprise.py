@@ -61,6 +61,10 @@ def main():
                         help="Write modes to compare")
     parser.add_argument("--max-m-norm", type=float, default=10.0,
                         help="Cap on M's Frobenius norm (0 = no cap)")
+    parser.add_argument("--chunk-aggs", type=str, nargs="+",
+                        default=["token"],
+                        choices=["token", "mean", "last", "surprise", "learned"],
+                        help="Chunk aggregation methods to compare")
     parser.add_argument("--lr", type=float, default=9e-4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -109,105 +113,113 @@ def main():
 
     for decay in decay_rates:
         for write_mode in args.write_modes:
-            run_key = f"decay={decay}_mode={write_mode}"
-            print(f"\n{'='*60}")
-            print(f"DECAY = {decay}, WRITE MODE = {write_mode}")
-            print(f"{'='*60}")
+            for chunk_agg in args.chunk_aggs:
+                # Skip invalid combo: surprise agg only works with surprise write modes
+                if chunk_agg == "surprise" and write_mode not in ("surprise", "surprise-fwd", "surprise-fwd-store"):
+                    print(f"\n  Skipping chunk_agg=surprise with write_mode={write_mode} (no surprise scores)")
+                    continue
 
-            # Build fresh model
-            model = GPT2LMHeadModel.from_pretrained("gpt2").to(device=device, dtype=dtype)
-            for p in model.parameters():
-                p.requires_grad = False
+                run_key = f"decay={decay}_mode={write_mode}_agg={chunk_agg}"
+                print(f"\n{'='*60}")
+                print(f"DECAY = {decay}, WRITE MODE = {write_mode}, CHUNK AGG = {chunk_agg}")
+                print(f"{'='*60}")
 
-            memory_modules = attach_fast_weight_memory(
-                model.transformer.h,
-                hidden_size=model.config.n_embd,
-                memory_size=args.memory_size,
-                decay=decay,
-                write_mode=write_mode,
-                max_m_norm=args.max_m_norm,
-            )
+                # Build fresh model
+                model = GPT2LMHeadModel.from_pretrained("gpt2").to(device=device, dtype=dtype)
+                for p in model.parameters():
+                    p.requires_grad = False
 
-            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"  Trainable params: {n_trainable:,}")
+                memory_modules = attach_fast_weight_memory(
+                    model.transformer.h,
+                    hidden_size=model.config.n_embd,
+                    memory_size=args.memory_size,
+                    decay=decay,
+                    write_mode=write_mode,
+                    max_m_norm=args.max_m_norm,
+                    chunk_agg=chunk_agg,
+                )
 
-            # Show surprise hyperparams
-            if write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
-                mem = memory_modules[0]
-                print(f"  surprise_scale: {mem.surprise_scale:.1f}")
-                print(f"  surprise_bias:  {mem.surprise_bias:.1f}")
+                n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"  Trainable params: {n_trainable:,}")
 
-            # Train
-            train_losses, log_data = train_sequential(
-                model, seq_dataset, device,
-                num_epochs=args.epochs, lr=args.lr,
-                warmup_steps=200, log_every=args.log_every,
-                model_name=run_key,
-            )
+                # Show surprise hyperparams
+                if write_mode in ("surprise", "surprise-fwd", "surprise-fwd-store"):
+                    mem = memory_modules[0]
+                    print(f"  surprise_scale: {mem.surprise_scale:.1f}")
+                    print(f"  surprise_bias:  {mem.surprise_bias:.1f}")
 
-            # Evaluate by position
-            print(f"\n  Evaluating by position...")
-            pos_with = evaluate_by_position(model, seq_dataset, device)
-            pos_without = evaluate_by_position_no_memory(model, seq_dataset, device)
+                # Train
+                train_losses, log_data = train_sequential(
+                    model, seq_dataset, device,
+                    num_epochs=args.epochs, lr=args.lr,
+                    warmup_steps=200, log_every=args.log_every,
+                    model_name=run_key,
+                )
 
-            # Print comparison
-            print(f"\n  {'Pos':>5} | {'With M':>8} | {'No M':>8} | {'Benefit':>8}")
-            print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
-            benefits = {}
-            for pos in sorted(set(pos_with) & set(pos_without)):
-                b = pos_without[pos] - pos_with[pos]
-                benefits[pos] = b
-                label = f"{pos}" if pos < 20 else "20+"
-                print(f"  {label:>5} | {pos_with[pos]:.4f} | {pos_without[pos]:.4f} | {b:+.4f}")
+                # Evaluate by position
+                print(f"\n  Evaluating by position...")
+                pos_with = evaluate_by_position(model, seq_dataset, device)
+                pos_without = evaluate_by_position_no_memory(model, seq_dataset, device)
 
-            # Summary stats
-            early_benefit = sum(benefits.get(p, 0) for p in range(1, 4)) / 3
-            late_positions = [p for p in range(10, 21) if p in benefits]
-            late_benefit = sum(benefits[p] for p in late_positions) / max(len(late_positions), 1)
-            growth = late_benefit - early_benefit
+                # Print comparison
+                print(f"\n  {'Pos':>5} | {'With M':>8} | {'No M':>8} | {'Benefit':>8}")
+                print(f"  {'-'*5}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
+                benefits = {}
+                for pos in sorted(set(pos_with) & set(pos_without)):
+                    b = pos_without[pos] - pos_with[pos]
+                    benefits[pos] = b
+                    label = f"{pos}" if pos < 20 else "20+"
+                    print(f"  {label:>5} | {pos_with[pos]:.4f} | {pos_without[pos]:.4f} | {b:+.4f}")
 
-            print(f"\n  Early benefit (chunks 1-3): {early_benefit:+.4f}")
-            print(f"  Late benefit (chunks 10+):  {late_benefit:+.4f}")
-            print(f"  Growth (late - early):      {growth:+.4f}")
-            if growth > 0.01:
-                print(f"  -> Memory benefit GROWS with position")
-            elif growth > -0.01:
-                print(f"  -> Memory benefit is FLAT")
-            else:
-                print(f"  -> Memory benefit DECREASES with position")
+                # Summary stats
+                early_benefit = sum(benefits.get(p, 0) for p in range(1, 4)) / 3
+                late_positions = [p for p in range(10, 21) if p in benefits]
+                late_benefit = sum(benefits[p] for p in late_positions) / max(len(late_positions), 1)
+                growth = late_benefit - early_benefit
 
-            # ── Memory reset ablation: is M real memory or just adapter? ──
-            print(f"\n  Memory reset ablation (adapter vs real memory)...")
-            reset_ablation = evaluate_memory_reset_ablation(
-                model, seq_dataset, device, reset_at_positions=(3, 5, 8, 12),
-            )
-            print(f"\n  {'Reset@':>8} | {'Normal':>8} | {'Reset':>8} | {'No M':>8} | {'Reset Cost':>10}")
-            print(f"  {'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*10}")
-            for pos, r in sorted(reset_ablation.items()):
-                print(f"  {f'K={pos}':>8} | {r['normal']:.4f} | {r['reset']:.4f} | "
-                      f"{r['no_memory']:.4f} | {r['reset_cost']:+.4f}")
-            print(f"\n  If reset_cost grows with K -> M stores real document info")
-            print(f"  If reset_cost is flat/zero -> M is just an adapter")
+                print(f"\n  Early benefit (chunks 1-3): {early_benefit:+.4f}")
+                print(f"  Late benefit (chunks 10+):  {late_benefit:+.4f}")
+                print(f"  Growth (late - early):      {growth:+.4f}")
+                if growth > 0.01:
+                    print(f"  -> Memory benefit GROWS with position")
+                elif growth > -0.01:
+                    print(f"  -> Memory benefit is FLAT")
+                else:
+                    print(f"  -> Memory benefit DECREASES with position")
 
-            all_results["runs"][run_key] = {
-                "decay": decay,
-                "write_mode": write_mode,
-                "pos_with_M": {str(k): v for k, v in pos_with.items()},
-                "pos_without_M": {str(k): v for k, v in pos_without.items()},
-                "benefits": {str(k): v for k, v in benefits.items()},
-                "early_benefit": early_benefit,
-                "late_benefit": late_benefit,
-                "growth": growth,
-                "reset_ablation": {str(k): v for k, v in reset_ablation.items()},
-                "training_log": log_data,
-            }
+                # ── Memory reset ablation: is M real memory or just adapter? ──
+                print(f"\n  Memory reset ablation (adapter vs real memory)...")
+                reset_ablation = evaluate_memory_reset_ablation(
+                    model, seq_dataset, device, reset_at_positions=(3, 5, 8, 12),
+                )
+                print(f"\n  {'Reset@':>8} | {'Normal':>8} | {'Reset':>8} | {'No M':>8} | {'Reset Cost':>10}")
+                print(f"  {'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*10}")
+                for pos, r in sorted(reset_ablation.items()):
+                    print(f"  {f'K={pos}':>8} | {r['normal']:.4f} | {r['reset']:.4f} | "
+                          f"{r['no_memory']:.4f} | {r['reset_cost']:+.4f}")
+                print(f"\n  If reset_cost grows with K -> M stores real document info")
+                print(f"  If reset_cost is flat/zero -> M is just an adapter")
 
-            # Save checkpoint
-            torch.save(model.state_dict(),
-                       Path(args.output_dir) / f"model_{run_key}.pt")
+                all_results["runs"][run_key] = {
+                    "decay": decay,
+                    "write_mode": write_mode,
+                    "chunk_agg": chunk_agg,
+                    "pos_with_M": {str(k): v for k, v in pos_with.items()},
+                    "pos_without_M": {str(k): v for k, v in pos_without.items()},
+                    "benefits": {str(k): v for k, v in benefits.items()},
+                    "early_benefit": early_benefit,
+                    "late_benefit": late_benefit,
+                    "growth": growth,
+                    "reset_ablation": {str(k): v for k, v in reset_ablation.items()},
+                    "training_log": log_data,
+                }
 
-            del model
-            torch.cuda.empty_cache()
+                # Save checkpoint
+                torch.save(model.state_dict(),
+                           Path(args.output_dir) / f"model_{run_key}.pt")
+
+                del model
+                torch.cuda.empty_cache()
 
     # ── Final comparison ──
     print(f"\n{'='*60}")

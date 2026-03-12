@@ -44,6 +44,7 @@ class FastWeightMemory(nn.Module):
         decay: float = 0.99,
         write_mode: str = "uniform",
         max_m_norm: float = 10.0,
+        chunk_agg: str = "token",
         # Legacy compat
         use_write_gate: bool = False,
     ):
@@ -52,6 +53,7 @@ class FastWeightMemory(nn.Module):
         self.memory_size = memory_size
         self.decay = decay
         self.max_m_norm = max_m_norm
+        self.chunk_agg = chunk_agg  # "token", "mean", "last", "surprise", "learned"
 
         # Handle legacy use_write_gate parameter
         if use_write_gate and write_mode == "uniform":
@@ -98,6 +100,12 @@ class FastWeightMemory(nn.Module):
             # bias controls baseline: negative = write less on average
             self.surprise_scale = 2.0   # hyperparameter, not learned
             self.surprise_bias = -0.5   # sigmoid(-0.5) ≈ 0.38 at mean error
+
+        # Learned attention pooling for chunk aggregation
+        if chunk_agg == "learned":
+            self.W_agg_score = nn.Linear(hidden_size, 1, bias=True)
+            nn.init.zeros_(self.W_agg_score.weight)
+            nn.init.zeros_(self.W_agg_score.bias)
 
         # NaN debugging flag — set to True to enable per-chunk NaN tracing
         self._nan_debug = False
@@ -243,7 +251,40 @@ class FastWeightMemory(nn.Module):
                 write_strength_log.append(ws_chunk.mean().item())
 
             # ── WRITE ──
-            chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
+            if self.chunk_agg == "token":
+                # Token-level: sum of outer products (original behavior)
+                chunk_outer = torch.einsum("bci,bcj->ij", v_chunk, k_chunk) / (batch * c_len)
+            else:
+                # Chunk-level: aggregate tokens into single key-value, one outer product
+                if self.chunk_agg == "mean":
+                    k_agg = k_chunk.mean(dim=1)  # (batch, memory_size)
+                    v_agg = v_chunk.mean(dim=1)
+                elif self.chunk_agg == "last":
+                    k_agg = k_chunk[:, -1, :]    # (batch, memory_size)
+                    v_agg = v_chunk[:, -1, :]
+                elif self.chunk_agg == "surprise":
+                    # Weight by surprise scores (reuse ws_chunk if available)
+                    if write_strength_log:  # surprise mode computed ws_chunk
+                        weights = ws_chunk / (ws_chunk.sum(dim=1, keepdim=True) + 1e-8)
+                        k_agg = (k_chunk * weights).sum(dim=1)
+                        v_agg = (v_chunk * weights).sum(dim=1)
+                    else:
+                        # Fallback to mean if no surprise scores
+                        k_agg = k_chunk.mean(dim=1)
+                        v_agg = v_chunk.mean(dim=1)
+                elif self.chunk_agg == "learned":
+                    x_chunk = x[:, chunk_start:chunk_end, :]
+                    scores = self.W_agg_score(x_chunk)  # (batch, c_len, 1)
+                    weights = torch.softmax(scores, dim=1)  # (batch, c_len, 1)
+                    k_agg = (k_chunk * weights).sum(dim=1)
+                    v_agg = (v_chunk * weights).sum(dim=1)
+                else:
+                    raise ValueError(f"Unknown chunk_agg: {self.chunk_agg}")
+
+                k_agg = F.normalize(k_agg, dim=-1)
+                v_agg = F.normalize(v_agg, dim=-1)
+                chunk_outer = torch.einsum("bi,bj->ij", v_agg, k_agg) / batch
+
             M = (self.decay ** c_len) * M + chunk_outer
 
             # ── NaN check: after write ──
@@ -289,7 +330,7 @@ class TransformerLayerWithMemory(nn.Module):
 
     def __init__(self, original_layer: nn.Module, hidden_size: int, memory_size: int = 256,
                  decay: float = 0.99, write_mode: str = "uniform", max_m_norm: float = 10.0,
-                 use_write_gate: bool = False):
+                 chunk_agg: str = "token", use_write_gate: bool = False):
         super().__init__()
         self.layer = original_layer
         self.memory = FastWeightMemory(
@@ -298,6 +339,7 @@ class TransformerLayerWithMemory(nn.Module):
             decay=decay,
             write_mode=write_mode,
             max_m_norm=max_m_norm,
+            chunk_agg=chunk_agg,
             use_write_gate=use_write_gate,
         )
 
@@ -329,7 +371,8 @@ class TransformerLayerWithMemory(nn.Module):
 
 
 def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_size=256, decay=0.99,
-                              write_mode="uniform", max_m_norm=10.0, use_write_gate=False):
+                              write_mode="uniform", max_m_norm=10.0, chunk_agg="token",
+                              use_write_gate=False):
     """Attach fast weight memory modules to specified transformer layers.
 
     Args:
@@ -340,6 +383,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
         decay: Memory decay rate per token.
         write_mode: "uniform", "gate", or "surprise".
         max_m_norm: Cap on M's Frobenius norm. 0 = no cap.
+        chunk_agg: Chunk aggregation method: "token", "mean", "last", "surprise", "learned".
 
     Returns:
         List of FastWeightMemory modules (for parameter access).
@@ -357,6 +401,7 @@ def attach_fast_weight_memory(layers, hidden_size, layer_indices=None, memory_si
             decay=decay,
             write_mode=write_mode,
             max_m_norm=max_m_norm,
+            chunk_agg=chunk_agg,
             use_write_gate=use_write_gate,
         )
         # Move to same device/dtype as model
