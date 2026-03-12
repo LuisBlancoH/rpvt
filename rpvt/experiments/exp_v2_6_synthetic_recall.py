@@ -463,6 +463,79 @@ def evaluate_recall(model, dataset, device, model_name="model"):
     }
 
 
+def _analyze_gate_values(model, dataset, device, n_docs=50):
+    """Analyze gate values by chunk type (store, filler, recall).
+
+    Returns dict with mean/std gate values for each chunk type, or None if no gates.
+    """
+    import types as _types
+
+    # Find memory modules with gates
+    memory_modules = []
+    for module in model.modules():
+        if isinstance(module, FastWeightMemory) and module.write_mode == "gate":
+            memory_modules.append(module)
+
+    if not memory_modules:
+        return None
+
+    chunk_size = dataset.chunk_size
+    gate_by_type = {"store": [], "filler": [], "recall": []}
+
+    docs = dataset.doc_sequences[:n_docs]
+    mem = memory_modules[0]  # analyze first layer
+
+    for doc in docs:
+        input_ids = doc["input_ids"].unsqueeze(0).to(device)
+        seq_len = input_ids.shape[1]
+        n_chunks = seq_len // chunk_size
+        gap = doc["gap"]
+        n_pairs = dataset.n_pairs
+
+        reset_memories(model)
+
+        # Capture gate values by patching forward
+        mem._captured_gates = None
+        orig_forward = mem.forward
+
+        def make_capture_forward(m, orig):
+            def capture_forward(x, chunk_size=64):
+                m._captured_gates = torch.sigmoid(m.W_gate(x)).detach().cpu().squeeze(-1).squeeze(0)
+                return orig(x, chunk_size)
+            return capture_forward
+
+        mem.forward = make_capture_forward(mem, orig_forward)
+
+        with torch.no_grad():
+            model(input_ids)
+
+        mem.forward = orig_forward
+
+        if mem._captured_gates is not None:
+            gates = mem._captured_gates  # (seq_len,)
+            for chunk_idx in range(n_chunks):
+                start = chunk_idx * chunk_size
+                end = start + chunk_size
+                chunk_mean = gates[start:end].mean().item()
+
+                if chunk_idx < n_pairs:
+                    gate_by_type["store"].append(chunk_mean)
+                elif chunk_idx < n_pairs + (gap - 1):
+                    gate_by_type["filler"].append(chunk_mean)
+                else:
+                    gate_by_type["recall"].append(chunk_mean)
+
+    result = {}
+    for ctype in ["store", "filler", "recall"]:
+        vals = gate_by_type[ctype]
+        if vals:
+            t = torch.tensor(vals)
+            result[ctype] = {"mean": t.mean().item(), "std": t.std().item()}
+        else:
+            result[ctype] = {"mean": 0.0, "std": 0.0}
+    return result
+
+
 def evaluate_recall_whole_doc(model, dataset, device, model_name="model"):
     """Evaluate recall by feeding whole documents."""
     model.eval()
@@ -522,11 +595,22 @@ def evaluate_recall_whole_doc(model, dataset, device, model_name="model"):
         for gap in sorted(total_by_gap)
     }
 
+    # Gate value analysis: measure gate strengths by chunk type
+    gate_analysis = _analyze_gate_values(model, dataset, device)
+    if gate_analysis:
+        print(f"\n  Gate values by chunk type:")
+        for ctype in ["store", "filler", "recall"]:
+            g = gate_analysis[ctype]
+            print(f"    {ctype.upper():>8s}: mean={g['mean']:.6f}, std={g['std']:.6f}")
+        print(f"    Store/Filler ratio:  {gate_analysis['store']['mean'] / max(gate_analysis['filler']['mean'], 1e-10):.1f}x")
+        print(f"    Recall/Filler ratio: {gate_analysis['recall']['mean'] / max(gate_analysis['filler']['mean'], 1e-10):.1f}x")
+
     return {
         "accuracy": accuracy,
         "correct": correct,
         "total": total,
         "accuracy_by_gap": accuracy_by_gap,
+        "gate_analysis": gate_analysis,
     }
 
 

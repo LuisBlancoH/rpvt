@@ -106,21 +106,38 @@ Testing M with multiple store/recall pairs per document (all: decay 0.999, 64 ke
 | Gate + recall-only | 47.1% | — | Same as recall-only |
 | **Gate + 100x** | **94.4%** | 25.4% | Works for 2 but not 4 |
 | Gate + 100x, 512d model | — | 0.8% | Larger model worse (optimization) |
-| Gate + 100x, 8-layer | — | running | |
+| Gate + 100x, 8-layer | — | 22.1% | Depth doesn't help |
+| Gate + 100x, 16 pairs | — | 5.2% | Chance level |
+
+### Key Discovery 7: Hard Gate is the Best Fix for 4-Pair Retrieval
+
+**Architectural fix results** (all: gate + 100x, 4 pairs, decay 0.999, 20 epochs):
+
+| Approach | 4-pair Recall | Notes |
+|---|---|---|
+| Gate (bias=-2) + 100x | 25.4% | Baseline (1/4 pattern) |
+| **Hard gate (bias=-5) + 100x** | **55.6%** | **Best result — 2.2/4 pairs correct** |
+| All three (tied+delta+hard) | 13.7% | Fixes interfere with each other |
+| Tied Q=K | 0.9% | Catastrophic — worse than no fix |
+| Delta rule | 0.6% | Catastrophic |
+| Tied Q=K + delta | 0.65% | Catastrophic |
+
+**Key insight**: The bottleneck is **filler noise in M**, not Q/K coordination or write interference. A harder gate (sigmoid(-5)≈0.007 vs sigmoid(-2)≈0.12) dramatically reduces filler writes, keeping stored pairs cleaner. The model *can* do key-dependent retrieval for 4 keys when M is clean enough.
+
+**Why tied Q=K and delta rule failed**: They solve the wrong problem. Tying Q=K constrains the model too much (can't learn asymmetric storage/retrieval representations). Delta rule adds computation that interferes with gradient flow through the gate.
+
+### Gate Value Analysis (in progress)
+
+Added gate logging to eval function (`_analyze_gate_values`): measures mean gate strength on store vs filler vs recall chunks. Currently retraining hard gate (bias=-5) with logging to verify hypothesis that gate learns store≫filler differentiation.
+
+Preliminary result from a short (10-epoch) analysis run: gate saturated to ~1.0 everywhere because the model never found the "use M" basin. Confirms that gate differentiation only emerges when the model successfully learns to use M — the gate and retrieval are co-dependent.
 
 ### Currently Running Experiments
 
-**Testing architectural fixes for 4-pair retrieval** (all: gate + 100x, 4 pairs, decay 0.999):
-
-1. **Tied Q=K** (`--tie-qk`): Share W_query = W_key so same key token produces matching vectors for both storage and retrieval
-2. **Delta rule** (`--delta-rule`): `M += k⊗(v - Mk)` — subtract old association before writing to reduce interference
-3. **Hard gate** (`--gate-bias -5`): Gate init at sigmoid(-5)≈0.007 instead of sigmoid(-2)≈0.12 for more aggressive filler suppression
-4. **Tied Q=K + delta**: Both fixes combined
-5. **All three**: Kitchen sink
-
-Also running:
-- Gate + 100x, 16 pairs (capacity test)
-- Gate + 100x, 4 pairs, 8-layer model (depth test)
+1. **Hard gate bias=-8, 4 pairs** — ~31% done. Testing if even harder suppression improves on 55.6%
+2. **Hard gate bias=-10, 4 pairs** — ~31% done. Near-zero filler writes
+3. **Hard gate bias=-5, 2 pairs** — ~42% done. Sanity check (should beat 94.4% from normal gate)
+4. **Hard gate bias=-5, 4 pairs + gate analysis** — ~12% done. Re-run with gate value logging to understand what the gate learns
 
 ### High Variance Problem
 
@@ -134,11 +151,13 @@ The optimization landscape has multiple basins. Most don't involve M. The model 
 ### Open Questions
 
 1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair.**
-2. ~~Does M scale to multiple pairs?~~ **Not yet — fails at 4+ pairs.**
-3. Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?
-4. Is the problem fundamentally optimization (need more seeds/training) or architectural?
-5. Does predictive M offer advantages on anticipation/planning tasks?
-6. Multi-timescale memory for agent planning (long-term vision)
+2. ~~Does M scale to multiple pairs?~~ **Partially — hard gate gets 55.6% on 4 pairs.**
+3. ~~Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?~~ **Hard gate helps significantly (55.6%). Tied Q=K and delta rule hurt.**
+4. Can harder gates (bias=-8, -10) push 4-pair recall higher?
+5. What gate pattern does a trained model learn? (store≫filler hypothesis)
+6. Is the problem fundamentally optimization (need more seeds/training) or architectural?
+7. Does predictive M offer advantages on anticipation/planning tasks?
+8. Multi-timescale memory for agent planning (long-term vision)
 
 ---
 *Last updated: 2026-03-12*
