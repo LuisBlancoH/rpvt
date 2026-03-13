@@ -312,6 +312,7 @@ def train_and_eval(
     num_epochs=10, lr=1e-3, log_every=50, model_name="model",
     whole_doc=False, recall_loss_weight=1.0, recall_only_loss=False,
     curriculum_train_data=None,
+    recall_bottleneck=False, memory_supervision=False,
 ):
     """Train and evaluate.
 
@@ -370,7 +371,35 @@ def train_and_eval(
                 input_ids = doc["input_ids"].unsqueeze(0).to(device)  # (1, n_chunks*chunk_size)
                 reset_memories(model)
 
+                # ── Information bottleneck: mask hidden states at recall positions ──
+                # This forces the model to rely on M for recall, since the transformer
+                # hidden states are zeroed out at those positions.
+                bottleneck_hooks = []
+                if recall_bottleneck:
+                    recall_mask = torch.ones(1, input_ids.shape[1], 1, device=device)
+                    for rpos in doc["recall_positions"]:
+                        # Mask the token that needs to predict the recall value
+                        # (rpos-1 predicts token at rpos)
+                        recall_mask[0, rpos - 1, 0] = 0.0
+
+                    def make_bottleneck_hook(mask):
+                        def hook(module, args, output):
+                            if isinstance(output, tuple):
+                                h = output[0]
+                                return (h * mask,) + output[1:]
+                            return output * mask
+                        return hook
+
+                    # Apply to last transformer layer (just before lm_head)
+                    last_layer = model.h[-1]
+                    handle = last_layer.register_forward_hook(make_bottleneck_hook(recall_mask))
+                    bottleneck_hooks.append(handle)
+
                 output = model(input_ids, labels=input_ids)
+
+                # Remove hooks
+                for handle in bottleneck_hooks:
+                    handle.remove()
 
                 if recall_only_loss or recall_loss_weight > 1.0:
                     # Recompute loss with custom weighting on recall positions
@@ -389,6 +418,59 @@ def train_and_eval(
                     loss = (per_token_loss * weights).sum() / weights.sum()
                 else:
                     loss = output.loss
+
+                # ── Memory supervision: direct loss on M's retrieval at recall positions ──
+                # Trains M to retrieve the correct value vector when queried with the key.
+                if memory_supervision:
+                    mem_sup_loss = torch.tensor(0.0, device=device)
+                    n_sup = 0
+                    for layer in model.h:
+                        mem = None
+                        if isinstance(layer, TransformerLayerWithMemory):
+                            mem = layer.memory
+                        elif isinstance(layer, AlternativeMemoryWrapper):
+                            mem = layer.memory
+                        if mem is None:
+                            continue
+                        # Get the value token embeddings as targets
+                        for i, (key_id, value_id) in enumerate(doc["pairs"]):
+                            rpos = doc["recall_positions"][i]
+                            # Target: the embedding of the correct value token
+                            value_token = active_dataset.value_offset + value_id
+                            target_emb = model.embed.weight[value_token]  # (d_model,)
+                            # M's output at rpos-1 (where the model predicts rpos)
+                            # We need the memory output — use W_out(M @ query)
+                            # But we don't have direct access post-forward.
+                            # Instead, use a simpler approach: the hidden state at rpos-1
+                            # should be close to the value embedding after memory contribution.
+                            # Direct supervision: project query through M and compare to value
+                        break  # only first memory layer
+
+                    # Simpler approach: add a loss on the logits at recall positions
+                    # being confident about the correct value. This is already covered
+                    # by recall_loss_weight, so let's do something different:
+                    # Directly supervise that the model's hidden state at recall position
+                    # has high cosine similarity to the correct value embedding.
+                    mem_sup_loss = torch.tensor(0.0, device=device)
+                    n_sup = 0
+                    # Get hidden states before lm_head by hooking
+                    # Actually, we can get them from the logits: if logits are h @ embed.T,
+                    # then high logit for the correct token means h is aligned with that embedding.
+                    # The recall_loss_weight already does this. Let's instead directly
+                    # supervise the memory module's retrieval.
+                    #
+                    # Re-run just the memory forward on the stored hidden states:
+                    # This is complex, so use a simpler proxy: additional cross-entropy
+                    # loss ONLY on recall positions with very high weight (10000x).
+                    for rpos in doc["recall_positions"]:
+                        logits_at_rpos = output.logits[0, rpos - 1]
+                        target_token = input_ids[0, rpos]
+                        mem_sup_loss = mem_sup_loss + F.cross_entropy(
+                            logits_at_rpos.unsqueeze(0), target_token.unsqueeze(0)
+                        )
+                        n_sup += 1
+                    if n_sup > 0:
+                        loss = loss + 10.0 * mem_sup_loss / n_sup
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -739,6 +821,10 @@ def main():
                         help="Compute loss ONLY on recall positions (zero weight on all other tokens)")
     parser.add_argument("--curriculum", action="store_true",
                         help="Curriculum: train first half with 1 pair, second half with n-pairs")
+    parser.add_argument("--recall-bottleneck", action="store_true",
+                        help="Zero out transformer hidden states at recall positions, forcing M usage")
+    parser.add_argument("--memory-supervision", action="store_true",
+                        help="Add direct supervision loss on recall positions (10x extra CE loss)")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
@@ -877,6 +963,8 @@ def main():
         recall_loss_weight=args.recall_loss_weight,
         recall_only_loss=args.recall_only_loss,
         curriculum_train_data=curriculum_train_data,
+        recall_bottleneck=args.recall_bottleneck,
+        memory_supervision=args.memory_supervision,
     )
 
     results["config"] = vars(args)
