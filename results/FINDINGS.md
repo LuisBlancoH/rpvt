@@ -91,10 +91,6 @@ Testing M with multiple store/recall pairs per document (all: decay 0.999, 64 ke
 
 **The gate enables key-dependent retrieval for 2 pairs** (debug shows both pairs correct with different predictions). But it doesn't help for 4+ pairs.
 
-**Why the gate helps**: It learns to write strongly on STORE chunks and weakly on fillers, reducing noise in M. But it can't solve the W_key/W_query coordination problem for 4+ keys.
-
-**Why it fails at 4+ pairs**: W_key and W_query are separate projections. The model must learn them to map the same key token (in STORE vs RECALL context) to matching vectors. This coordination is easy for 2 keys but hard for 4+.
-
 ### Approaches Tried for Multi-Pair (4 pairs)
 
 | Approach | 2 pairs | 4 pairs | Notes |
@@ -166,37 +162,64 @@ Gate values from a trained model that failed (1.3% recall, bias=-5):
 | Architecture | 4-pair Recall | Notes |
 |---|---|---|
 | **Hopfield** (softmax retrieval, 32 slots) | 1.1% | Same optimization problem |
-| **Slot** (content-based addressing, 32 slots) | running | |
+| **Slot** (content-based addressing, 32 slots) | 16.7% | Better than chance but not great |
 
-**Hopfield failed** — same as M-matrix. The problem is not retrieval quality (linear vs softmax) but that the optimizer never discovers how to use memory at all. Softmax retrieval is theoretically better (exponential capacity) but can't help if the model doesn't learn to write meaningful content.
+Both alternative architectures hit the same optimization problem — the model doesn't learn to use memory regardless of retrieval mechanism.
+
+### Optimization Tricks Tested
+
+| Approach | 4-pair Recall | Notes |
+|---|---|---|
+| Recall bottleneck (zero hidden states) | 0.0% | Too harsh — kills everything |
+| Memory supervision (10x extra CE) | 0.9% | Extra loss didn't help |
+| Both combined | 0.0% | Same as bottleneck |
+
+### Key Discovery 10: Two-Phase Training Solves Gate Learning
+
+**Two-phase**: Phase 1 = freeze transformer, train only memory. Phase 2 = unfreeze all.
+
+| Approach | 4-pair Recall | Notes |
+|---|---|---|
+| Two-phase (fast weight M) | 5.4% | **Correct gate pattern learned!** |
+| **Two-phase (Hopfield)** | **18.1%** | **Best non-fluke result** |
+
+**Gate values from two-phase fast weight model:**
+
+| Chunk type | Gate value |
+|---|---|
+| **STORE** | **0.55** |
+| **FILLER** | **0.000** |
+| **RECALL** | **0.16** |
+
+**Breakthrough:** Store/Filler ratio = 1.6 million. The gate learned exactly what we hypothesized — write strongly on STORE chunks, completely suppress fillers. This is the first time we've seen the correct gate pattern. Two-phase training forces M to learn because the transformer can't adapt to compensate.
+
+**Why two-phase works:** In normal training, the transformer has ~2M params that can minimize loss without M. M starts at zero (W_out zero-init) and contributes nothing initially. The transformer learns to solve the task without M, and once that solution is found, there's no gradient to start using M. Two-phase prevents this by freezing the transformer, so M is the only thing that can improve the loss.
+
+**Why Hopfield outperformed M-matrix (18.1% vs 5.4%):** Once the gate learns correctly (which two-phase ensures), Hopfield's softmax retrieval is strictly better at selecting the right stored pair. The gate solves "what to write," Hopfield solves "how to read."
 
 ### The Core Problem: Optimization, Not Architecture
 
-Every architecture and fix we've tried fails for the same reason: the "ignore M" local minimum is much easier to find than the "use M" basin. The model can always minimize loss by:
-1. Predicting filler tokens from context (easy, dominates the loss)
-2. Ignoring recall tokens (small fraction of total loss, even with 100x weight)
-
-**This is not an architecture problem — it's an optimization problem.** Changing retrieval (Hopfield), write rules (delta), key matching (tied Q=K), or gate bias doesn't help because the optimizer never even tries to use M.
+The "ignore M" local minimum is much easier to find than the "use M" basin. Two-phase training is the first approach that reliably forces the optimizer into the correct basin by eliminating the "ignore M" option.
 
 ### Currently Running Experiments
 
-**New approach: force M usage through training tricks:**
+**Three-phase training** (pretrain transformer → freeze + train memory → unfreeze all):
 
-1. **Recall bottleneck** — Zero out transformer hidden states at recall positions. M becomes the ONLY path for recall information. Forces the optimizer to use M.
-2. **Memory supervision** — Add 10x extra CE loss directly on recall positions. Stronger gradient signal for M.
-3. **Both combined** — Bottleneck + supervision.
-4. **Slot memory** (32 slots) — Still running from earlier batch.
+1. **Three-phase fast weight** (33/33/33 split, 20 epochs) — M learns from useful representations instead of random weights
+2. **Three-phase Hopfield** (33/33/33, 20 epochs) — best architecture + best optimization
+3. **Three-phase Hopfield long-p1** (25/50/25, 20 epochs) — more time for memory to learn
+4. **Two-phase Hopfield 40 epochs** (50/50) — test if 18.1% improves with more training
 
 ### Open Questions
 
 1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair.**
-2. ~~Does M scale to multiple pairs?~~ **No — 55.6% was a fluke. Fails consistently at 4+ pairs.**
-3. ~~Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?~~ **No. All fail or are seed-dependent.**
-4. ~~Can Hopfield (softmax retrieval) solve it?~~ **No. Same optimization problem.**
-5. Can information bottleneck (forcing M usage) solve the optimization problem?
-6. Can direct memory supervision provide enough gradient signal?
-7. If bottleneck works: does it generalize when the bottleneck is removed?
-8. Does predictive M offer advantages on anticipation/planning tasks?
+2. ~~Does M scale to multiple pairs?~~ **Not with standard training. Two-phase + Hopfield gets 18.1%.**
+3. ~~Can architecture changes solve it?~~ **No — optimization is the bottleneck.**
+4. ~~Can two-phase training solve the optimization problem?~~ **Partially — correct gate pattern learned, 18.1% with Hopfield.**
+5. Can three-phase training improve on two-phase? (transformer pretrained → better M features)
+6. Does more training (40 epochs) push two-phase Hopfield higher?
+7. Once solved for 4 pairs: does it scale to 8, 16?
+8. Predictive Hopfield for planning (store transitions, chain retrievals)
 9. Multi-timescale memory for agent planning (long-term vision)
 
 ---
