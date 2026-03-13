@@ -35,6 +35,7 @@ class HopfieldMemory(nn.Module):
         write_mode: str = "gate",
         gate_bias: float = -2.0,
         w_out_std: float = 0.0,
+        init_qk_shared: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -48,6 +49,10 @@ class HopfieldMemory(nn.Module):
         self.W_key = nn.Linear(hidden_size, memory_size, bias=False)
         self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
         self.W_value = nn.Linear(hidden_size, memory_size, bias=False)
+
+        # Initialize W_query = W_key so queries match keys from the start
+        if init_qk_shared:
+            self.W_query.weight.data.copy_(self.W_key.weight.data)
 
         # Output projection
         self.W_out = nn.Linear(memory_size, hidden_size, bias=False)
@@ -73,6 +78,7 @@ class HopfieldMemory(nn.Module):
         self.register_buffer("write_ptr", torch.tensor(0, dtype=torch.long))
 
         self._nan_debug = False
+        self.persistent_grad = False  # if True, don't detach state between calls
 
     def reset_memory(self):
         self.K_mem.zero_()
@@ -92,24 +98,29 @@ class HopfieldMemory(nn.Module):
         """
         batch, seq_len, _ = x.shape
 
-        query = self.W_query(x)
-        key = self.W_key(x)
-        value = self.W_value(x)
+        # Cast x to match parameter dtype (handles bf16 input with fp32 params)
+        param_dtype = self.W_query.weight.dtype
+        x_cast = x.to(dtype=param_dtype)
+
+        query = self.W_query(x_cast)
+        key = self.W_key(x_cast)
+        value = self.W_value(x_cast)
 
         key = F.normalize(key, dim=-1)
         value = F.normalize(value, dim=-1)
 
         if self.write_mode == "gate":
-            gate_strengths = torch.sigmoid(self.W_gate(x))  # (batch, seq_len, 1)
+            gate_strengths = torch.sigmoid(self.W_gate(x_cast))  # (batch, seq_len, 1)
 
         beta = self.log_beta.exp()
 
         retrieved_chunks = []
         write_strength_log = []
 
-        K_mem = self.K_mem.clone()  # (n_slots, memory_size)
-        V_mem = self.V_mem.clone()
-        mem_strength = self.mem_strength.clone()  # (n_slots,)
+        # Cast buffers to match parameter dtype
+        K_mem = self.K_mem.clone().to(dtype=param_dtype)
+        V_mem = self.V_mem.clone().to(dtype=param_dtype)
+        mem_strength = self.mem_strength.clone().to(dtype=param_dtype)
         write_ptr = self.write_ptr.clone()
 
         for chunk_start in range(0, seq_len, chunk_size):
@@ -125,7 +136,7 @@ class HopfieldMemory(nn.Module):
                 r_chunk = torch.zeros_like(q_chunk)
             else:
                 # Mask out empty slots
-                slot_mask = (mem_strength > 1e-8).float()  # (n_slots,)
+                slot_mask = (mem_strength > 1e-8).to(dtype=param_dtype)  # (n_slots,)
                 attn_scores = torch.matmul(q_chunk, K_mem.T) * beta  # (batch, c_len, n_slots)
                 attn_scores = attn_scores + (1 - slot_mask).unsqueeze(0).unsqueeze(0) * (-1e9)
                 attn_weights = F.softmax(attn_scores, dim=-1)  # (batch, c_len, n_slots)
@@ -160,7 +171,7 @@ class HopfieldMemory(nn.Module):
 
             # Write to next slot (circular buffer) — no in-place ops for autograd
             slot_idx = write_ptr % self.n_slots
-            mask = F.one_hot(slot_idx, self.n_slots).float()  # (n_slots,)
+            mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)  # (n_slots,)
             mask_2d = mask.unsqueeze(1)  # (n_slots, 1)
             K_mem = K_mem * (1 - mask_2d) + mask_2d * k_agg.unsqueeze(0)
             V_mem = V_mem * (1 - mask_2d) + mask_2d * v_agg.unsqueeze(0)
@@ -168,10 +179,17 @@ class HopfieldMemory(nn.Module):
             write_ptr = write_ptr + 1
 
         # Store updated memory
-        self.K_mem = K_mem.detach()
-        self.V_mem = V_mem.detach()
-        self.mem_strength = mem_strength.detach()
-        self.write_ptr = write_ptr.detach()
+        if self.persistent_grad:
+            # Keep computation graph alive for cross-chunk gradient flow
+            self.K_mem = K_mem
+            self.V_mem = V_mem
+            self.mem_strength = mem_strength
+            self.write_ptr = write_ptr.detach()  # ptr is always detached (integer)
+        else:
+            self.K_mem = K_mem.detach()
+            self.V_mem = V_mem.detach()
+            self.mem_strength = mem_strength.detach()
+            self.write_ptr = write_ptr.detach()
 
         retrieved = torch.cat(retrieved_chunks, dim=1)
         output = self.W_out(retrieved)
@@ -180,6 +198,9 @@ class HopfieldMemory(nn.Module):
         max_output_norm = 10.0
         output_norm = output.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         output = output * (max_output_norm / output_norm).clamp(max=1.0)
+
+        # Cast output back to original input dtype
+        output = output.to(dtype=x.dtype)
 
         mean_ws = sum(write_strength_log) / len(write_strength_log) if write_strength_log else None
         return output, mean_ws, {}

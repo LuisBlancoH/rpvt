@@ -201,26 +201,74 @@ Both alternative architectures hit the same optimization problem — the model d
 
 The "ignore M" local minimum is much easier to find than the "use M" basin. Two-phase training is the first approach that reliably forces the optimizer into the correct basin by eliminating the "ignore M" option.
 
+### Key Discovery 11: Three-Phase Training Worse Than Two-Phase
+
+**Three-phase** (pretrain transformer → freeze + train memory → unfreeze all):
+
+| Approach | 4-pair Recall | Gate ratio |
+|---|---|---|
+| Three-phase fast weight (33/33/33) | 0.5% | 12.6x |
+| Three-phase Hopfield (33/33/33) | 0.6% | — |
+| Three-phase Hopfield long-p1 (25/50/25) | 0.9% | — |
+| **Two-phase Hopfield 20ep** | **18.1%** | **1.6M** |
+
+**Why three-phase is worse:** A pretrained transformer already solves filler prediction. When M starts training in phase 1, there's weak gradient pressure because loss is already low. A *helpless* (random) transformer is the best teacher for M — maximum gradient forces M to learn.
+
+### Key Discovery 12: More Training Helps Two-Phase (25.8%)
+
+| Epochs | Two-phase Hopfield 4-pair |
+|---|---|
+| 20 | 18.1% |
+| **40** | **25.8%** |
+
+Consistent across gaps (23-29% per gap). The model retrieves ~1 of 4 pairs correctly. Still stuck in "retrieve one fixed pair" pattern, but more training pushes it higher.
+
+---
+
+## v3.1: Pretrained Model + LoRA + Hopfield Memory
+
+**Setup**: Qwen2.5-3B (frozen, bf16) + LoRA (rank 16, q_proj/v_proj) + Hopfield memory (256-dim, 64 slots) attached at layer 18/36.
+
+### Key Discovery 13: Per-Chunk Processing Required
+
+With whole-document processing, the pretrained model's self-attention sees all tokens — memory is redundant. LoRA alone gets 100% on 4 pairs (full attention) or 92% (chunk-local attention mask, learning from shared weights).
+
+**Per-chunk processing**: each chunk gets its own `model()` call. Memory state persists across chunks (with gradient flow). No cross-chunk attention — memory is the only information channel.
+
+| Approach | 1-pair Recall | Notes |
+|---|---|---|
+| LoRA only (per-chunk) | **1.0%** | Chance — confirms memory is necessary |
+| LoRA + Memory (per-chunk, joint) | **0.0%** | Gate perfect, retrieval fails |
+
+### Key Discovery 14: Gate Learns Perfectly, Retrieval Fails
+
+Per-chunk joint training (LoRA + Memory, 5 epochs, 500 docs):
+
+| Chunk type | Gate value |
+|---|---|
+| **STORE** | **0.71** |
+| **FILLER** | **0.000** |
+| **RECALL** | **0.002** |
+| Store/Filler ratio | **1.8 billion x** |
+
+The gate learns the perfect write pattern immediately — far cleaner than any v2.6 result. But recall accuracy is 0%. The bottleneck is **query-key alignment**: W_query applied to RECALL hidden states doesn't match W_key applied to STORE hidden states. The pretrained model produces very different representations for the same key token in different contexts.
+
 ### Currently Running Experiments
 
-**Three-phase training** (pretrain transformer → freeze + train memory → unfreeze all):
+**Shared Q=K initialization** (W_query initialized as copy of W_key, then trained independently):
 
-1. **Three-phase fast weight** (33/33/33 split, 20 epochs) — M learns from useful representations instead of random weights
-2. **Three-phase Hopfield** (33/33/33, 20 epochs) — best architecture + best optimization
-3. **Three-phase Hopfield long-p1** (25/50/25, 20 epochs) — more time for memory to learn
-4. **Two-phase Hopfield 40 epochs** (50/50) — test if 18.1% improves with more training
+1. **Shared init** (10 epochs, 500 docs) — tests if alignment bootstrapping enables retrieval
+2. **Random init baseline** (10 epochs, 500 docs) — control with more training
 
 ### Open Questions
 
-1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair.**
-2. ~~Does M scale to multiple pairs?~~ **Not with standard training. Two-phase + Hopfield gets 18.1%.**
-3. ~~Can architecture changes solve it?~~ **No — optimization is the bottleneck.**
-4. ~~Can two-phase training solve the optimization problem?~~ **Partially — correct gate pattern learned, 18.1% with Hopfield.**
-5. Can three-phase training improve on two-phase? (transformer pretrained → better M features)
-6. Does more training (40 epochs) push two-phase Hopfield higher?
-7. Once solved for 4 pairs: does it scale to 8, 16?
-8. Predictive Hopfield for planning (store transitions, chain retrievals)
-9. Multi-timescale memory for agent planning (long-term vision)
+1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair (v2.6).**
+2. ~~Does M scale to multiple pairs?~~ **Two-phase + Hopfield gets 25.8% at 40ep.**
+3. ~~Can three-phase improve on two-phase?~~ **No — pretrained transformer hurts M learning.**
+4. ~~Does per-chunk processing make memory necessary?~~ **Yes — LoRA alone at chance.**
+5. Can shared Q=K init solve the retrieval alignment problem?
+6. Does the pretrained model need LoRA adaptation at the memory layer specifically?
+7. Once retrieval works: scale to 4+ pairs, then predictive memory for planning
 
 ---
 *Last updated: 2026-03-13*
