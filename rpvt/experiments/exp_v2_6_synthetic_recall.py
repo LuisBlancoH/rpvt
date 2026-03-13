@@ -255,9 +255,55 @@ class SmallTransformerLM(nn.Module):
         return type('Output', (), {'loss': loss, 'logits': logits})()
 
 
+class AlternativeMemoryWrapper(nn.Module):
+    """Wraps a transformer layer with an alternative memory module (Hopfield/Slot).
+
+    Same interface as TransformerLayerWithMemory but works with any memory
+    that has forward(x, chunk_size) -> (output, ws, aux) and reset_memory().
+    """
+    def __init__(self, original_layer, memory_module):
+        super().__init__()
+        self.layer = original_layer
+        self.memory = memory_module
+        self._aux_losses = {}
+
+    def forward(self, *args, **kwargs):
+        outputs = self.layer(*args, **kwargs)
+        if isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
+        memory_output, gate_value, aux_losses = self.memory(hidden_states)
+        self._aux_losses = aux_losses
+        modified = hidden_states + memory_output
+        if isinstance(outputs, tuple):
+            return (modified,) + outputs[1:]
+        return modified
+
+    def reset_memory(self):
+        self.memory.reset_memory()
+
+
+def _attach_alternative_memory(layers, memory_cls, **kwargs):
+    """Attach an alternative memory type (Hopfield/Slot) to transformer layers."""
+    memory_modules = []
+    for idx in range(len(layers)):
+        original_layer = layers[idx]
+        mem = memory_cls(**kwargs)
+        device = next(original_layer.parameters()).device
+        dtype = next(original_layer.parameters()).dtype
+        mem = mem.to(device=device, dtype=dtype)
+        wrapped = AlternativeMemoryWrapper(original_layer, mem)
+        layers[idx] = wrapped
+        memory_modules.append(mem)
+    return memory_modules
+
+
 def reset_memories(model):
     for layer in model.h:
         if isinstance(layer, TransformerLayerWithMemory):
+            layer.reset_memory()
+        elif isinstance(layer, AlternativeMemoryWrapper):
             layer.reset_memory()
 
 
@@ -682,6 +728,11 @@ def main():
                         help="Use delta update rule: M += k⊗(v - Mk) to reduce interference")
     parser.add_argument("--gate-bias", type=float, default=-2.0,
                         help="Gate bias init (sigmoid(-2)=0.12, sigmoid(-5)=0.007)")
+    parser.add_argument("--memory-type", type=str, default="fast_weight",
+                        choices=["fast_weight", "hopfield", "slot"],
+                        help="Memory architecture: fast_weight (M matrix), hopfield (softmax retrieval), slot (discrete slots)")
+    parser.add_argument("--n-slots", type=int, default=32,
+                        help="Number of memory slots (for hopfield/slot memory types)")
     parser.add_argument("--recall-loss-weight", type=float, default=1.0,
                         help="Extra weight on recall token loss (1.0 = uniform, 100 = 100x recall)")
     parser.add_argument("--recall-only-loss", action="store_true",
@@ -764,22 +815,50 @@ def main():
         if args.tie_qk: extras.append("tie_qk")
         if args.delta_rule: extras.append("delta")
         if args.gate_bias != -2.0: extras.append(f"gate_bias={args.gate_bias}")
+        if args.memory_type != "fast_weight": extras.append(f"type={args.memory_type}")
+        if args.memory_type in ("hopfield", "slot"): extras.append(f"slots={args.n_slots}")
         print(f"  Attaching memory (size={args.memory_size}, decay={args.decay}, "
               f"mode={args.write_mode}, bptt={args.bptt_steps}, w_out_std={args.w_out_std}"
               f"{', ' + ', '.join(extras) if extras else ''})")
-        memory_modules = attach_fast_weight_memory(
-            model.h,
-            hidden_size=args.d_model,
-            memory_size=args.memory_size,
-            decay=args.decay,
-            write_mode=args.write_mode,
-            max_m_norm=args.max_m_norm,
-            bptt_steps=args.bptt_steps,
-            w_out_std=args.w_out_std,
-            tie_qk=args.tie_qk,
-            delta_rule=args.delta_rule,
-            gate_bias=args.gate_bias,
-        )
+
+        if args.memory_type == "fast_weight":
+            memory_modules = attach_fast_weight_memory(
+                model.h,
+                hidden_size=args.d_model,
+                memory_size=args.memory_size,
+                decay=args.decay,
+                write_mode=args.write_mode,
+                max_m_norm=args.max_m_norm,
+                bptt_steps=args.bptt_steps,
+                w_out_std=args.w_out_std,
+                tie_qk=args.tie_qk,
+                delta_rule=args.delta_rule,
+                gate_bias=args.gate_bias,
+            )
+        elif args.memory_type == "hopfield":
+            from rpvt.model.hopfield_memory import HopfieldMemory
+            memory_modules = _attach_alternative_memory(
+                model.h, HopfieldMemory,
+                hidden_size=args.d_model,
+                memory_size=args.memory_size,
+                n_slots=args.n_slots,
+                decay=args.decay,
+                write_mode=args.write_mode,
+                gate_bias=args.gate_bias,
+                w_out_std=args.w_out_std,
+            )
+        elif args.memory_type == "slot":
+            from rpvt.model.slot_memory import SlotMemory
+            memory_modules = _attach_alternative_memory(
+                model.h, SlotMemory,
+                hidden_size=args.d_model,
+                memory_size=args.memory_size,
+                n_slots=args.n_slots,
+                decay=args.decay,
+                write_mode=args.write_mode,
+                gate_bias=args.gate_bias,
+                w_out_std=args.w_out_std,
+            )
     else:
         print("  No memory (baseline)")
 
