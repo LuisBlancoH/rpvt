@@ -313,7 +313,7 @@ def train_and_eval(
     whole_doc=False, recall_loss_weight=1.0, recall_only_loss=False,
     curriculum_train_data=None,
     recall_bottleneck=False, memory_supervision=False,
-    two_phase=False,
+    two_phase=False, three_phase=False, phase_split="equal",
 ):
     """Train and evaluate.
 
@@ -330,25 +330,32 @@ def train_and_eval(
     two_phase: Phase 1 (first half of epochs): freeze transformer, train only
     memory parameters. Phase 2 (second half): unfreeze everything.
     """
-    # Identify memory vs transformer parameters for two-phase training
+    # Identify memory vs transformer parameters for phased training
     memory_param_names = set()
-    if two_phase:
+    if two_phase or three_phase:
         for name, module in model.named_modules():
             if isinstance(module, (FastWeightMemory, AlternativeMemoryWrapper)):
                 for pname, _ in module.named_parameters():
                     memory_param_names.add(f"{name}.{pname}")
-            # Also catch memory modules from hopfield/slot
             from rpvt.model.hopfield_memory import HopfieldMemory
             from rpvt.model.slot_memory import SlotMemory
             if isinstance(module, (HopfieldMemory, SlotMemory)):
                 for pname, _ in module.named_parameters():
                     memory_param_names.add(f"{name}.{pname}")
 
+    if three_phase:
+        # Phase 0: train transformer only (freeze memory)
+        for name, param in model.named_parameters():
+            if name in memory_param_names:
+                param.requires_grad = False
+        n_trainable = sum(1 for n, p in model.named_parameters() if p.requires_grad)
+        n_frozen = sum(1 for n, p in model.named_parameters() if not p.requires_grad)
+        print(f"  Three-phase: Phase 0 — {n_trainable} transformer params trainable, {n_frozen} memory params frozen")
+    elif two_phase:
         # Phase 1: freeze everything except memory
         for name, param in model.named_parameters():
             if name not in memory_param_names:
                 param.requires_grad = False
-
         n_frozen = sum(1 for n, p in model.named_parameters() if not p.requires_grad)
         n_trainable = sum(1 for n, p in model.named_parameters() if p.requires_grad)
         print(f"  Two-phase: Phase 1 — {n_trainable} memory params trainable, {n_frozen} transformer params frozen")
@@ -382,29 +389,70 @@ def train_and_eval(
     train_losses = []
     start_time = time.time()
 
-    phase_switch_epoch = num_epochs // 2
-    phase_switched = False
+    # Compute phase boundaries
+    if three_phase:
+        if phase_split == "long-p1":
+            phase_0_end = num_epochs // 4          # 25% pretrain transformer
+            phase_1_end = phase_0_end + num_epochs // 2  # 50% train memory
+            # remaining 25% = fine-tune all
+        else:
+            phase_0_end = num_epochs // 3          # 33% pretrain transformer
+            phase_1_end = 2 * num_epochs // 3      # 33% train memory
+            # remaining 33% = fine-tune all
+    elif two_phase:
+        phase_0_end = 0  # no phase 0
+        if phase_split == "long-p1":
+            phase_1_end = 3 * num_epochs // 4      # 75% train memory
+        else:
+            phase_1_end = num_epochs // 2           # 50% train memory
+    else:
+        phase_0_end = 0
+        phase_1_end = 0
+
+    phase_0_done = False
+    phase_1_done = False
 
     for epoch in range(num_epochs):
-        # Two-phase: unfreeze transformer at halfway point
-        if two_phase and epoch == phase_switch_epoch and not phase_switched:
-            print(f"  [{model_name}] === PHASE 2: Unfreezing transformer ===")
+        # Three-phase: Phase 0 → Phase 1 transition (freeze transformer, unfreeze memory)
+        if three_phase and epoch == phase_0_end and not phase_0_done:
+            print(f"  [{model_name}] === PHASE 1: Freezing transformer, training memory ===")
             for name, param in model.named_parameters():
-                param.requires_grad = True
-            # Rebuild optimizer with all parameters
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.1, weight_decay=0.01)
-            # Reset scheduler for phase 2
+                if name in memory_param_names:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+            optimizer = torch.optim.AdamW(
+                [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01
+            )
             remaining_steps = total_steps - global_step
-            def lr_schedule_p2(step):
+            def lr_schedule_p1(step, _rem=remaining_steps):
                 warmup = 100
                 if step < warmup:
                     return step / warmup
-                progress = (step - warmup) / max(remaining_steps - warmup, 1)
+                progress = (step - warmup) / max(_rem - warmup, 1)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_p1)
+            n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            print(f"  [{model_name}] {n_trainable} memory params trainable, lr={lr:.1e}")
+            phase_0_done = True
+
+        # Phase 1 → Phase 2 transition (unfreeze everything)
+        if (two_phase or three_phase) and epoch == phase_1_end and not phase_1_done:
+            print(f"  [{model_name}] === PHASE 2: Unfreezing all parameters ===")
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.1, weight_decay=0.01)
+            remaining_steps = total_steps - global_step
+            def lr_schedule_p2(step, _rem=remaining_steps):
+                warmup = 100
+                if step < warmup:
+                    return step / warmup
+                progress = (step - warmup) / max(_rem - warmup, 1)
                 return 0.5 * (1 + math.cos(math.pi * progress))
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_p2)
             n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
             print(f"  [{model_name}] All {n_trainable} params trainable, lr={lr * 0.1:.1e}")
-            phase_switched = True
+            phase_1_done = True
 
         # Curriculum: use 1-pair data for first half, N-pair for second half
         if curriculum_train_data is not None and epoch < curriculum_switch_epoch:
@@ -879,6 +927,11 @@ def main():
                         help="Add direct supervision loss on recall positions (10x extra CE loss)")
     parser.add_argument("--two-phase", action="store_true",
                         help="Phase 1: freeze transformer, train only memory. Phase 2: unfreeze all.")
+    parser.add_argument("--three-phase", action="store_true",
+                        help="Phase 0: train transformer without memory. Phase 1: freeze transformer, train memory. Phase 2: unfreeze all.")
+    parser.add_argument("--phase-split", type=str, default="equal",
+                        choices=["equal", "long-p1"],
+                        help="Phase split: 'equal' = 33/33/33 (three-phase) or 50/50 (two-phase). 'long-p1' = 25/50/25 or 25/75.")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
@@ -1020,6 +1073,8 @@ def main():
         recall_bottleneck=args.recall_bottleneck,
         memory_supervision=args.memory_supervision,
         two_phase=args.two_phase,
+        three_phase=args.three_phase,
+        phase_split=args.phase_split,
     )
 
     results["config"] = vars(args)
