@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from rpvt.model.fast_weight import (
     attach_fast_weight_memory,
+    FastWeightMemory,
     TransformerLayerWithMemory,
 )
 
@@ -705,21 +706,27 @@ def main():
                         help="Run without memory (baseline)")
     parser.add_argument("--whole-doc", action="store_true",
                         help="Feed whole documents as single sequences (enables gradient flow through M)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for dataset and model init")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = args.device
 
-    print("Creating synthetic recall datasets...")
+    # Set random seed for reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+
+    print(f"Creating synthetic recall datasets (seed={args.seed})...")
     train_data = SyntheticRecallDataset(
         n_docs=args.n_train, gap_range=(args.gap_min, args.gap_max),
         chunk_size=args.chunk_size, n_keys=args.n_keys, n_values=args.n_values,
-        n_pairs=args.n_pairs, seed=42,
+        n_pairs=args.n_pairs, seed=args.seed,
     )
     eval_data = SyntheticRecallDataset(
         n_docs=args.n_eval, gap_range=(args.gap_min, args.gap_max),
         chunk_size=args.chunk_size, n_keys=args.n_keys, n_values=args.n_values,
-        n_pairs=args.n_pairs, seed=1337,
+        n_pairs=args.n_pairs, seed=args.seed + 1000,
     )
 
     # Curriculum: also create 1-pair dataset for phase 1
