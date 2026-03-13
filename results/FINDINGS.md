@@ -109,55 +109,95 @@ Testing M with multiple store/recall pairs per document (all: decay 0.999, 64 ke
 | Gate + 100x, 8-layer | — | 22.1% | Depth doesn't help |
 | Gate + 100x, 16 pairs | — | 5.2% | Chance level |
 
-### Key Discovery 7: Hard Gate is the Best Fix for 4-Pair Retrieval
+### Key Discovery 7: Hard Gate Result Was a Lucky Seed
 
 **Architectural fix results** (all: gate + 100x, 4 pairs, decay 0.999, 20 epochs):
 
 | Approach | 4-pair Recall | Notes |
 |---|---|---|
 | Gate (bias=-2) + 100x | 25.4% | Baseline (1/4 pattern) |
-| **Hard gate (bias=-5) + 100x** | **55.6%** | **Best result — 2.2/4 pairs correct** |
+| Hard gate (bias=-5) + 100x, seed=42 | **55.6%** | Lucky seed |
 | All three (tied+delta+hard) | 13.7% | Fixes interfere with each other |
-| Tied Q=K | 0.9% | Catastrophic — worse than no fix |
+| Tied Q=K | 0.9% | Catastrophic |
 | Delta rule | 0.6% | Catastrophic |
 | Tied Q=K + delta | 0.65% | Catastrophic |
 
-**Key insight**: The bottleneck is **filler noise in M**, not Q/K coordination or write interference. A harder gate (sigmoid(-5)≈0.007 vs sigmoid(-2)≈0.12) dramatically reduces filler writes, keeping stored pairs cleaner. The model *can* do key-dependent retrieval for 4 keys when M is clean enough.
+**Gate bias sweep** (all: gate + 100x, 4 pairs, seed=42):
 
-**Why tied Q=K and delta rule failed**: They solve the wrong problem. Tying Q=K constrains the model too much (can't learn asymmetric storage/retrieval representations). Delta rule adds computation that interferes with gradient flow through the gate.
+| Bias | sigmoid(bias) | 4-pair Recall |
+|---|---|---|
+| -2 | 0.12 | 25.4% |
+| -3 | 0.047 | 0.7% |
+| -4 | 0.018 | 0.6% |
+| **-5** | **0.007** | **55.6%** |
+| -8 | 0.0003 | 0.6% |
+| -10 | 0.00005 | 0.8% |
 
-### Gate Value Analysis (in progress)
+No consistent pattern — bias=-5 worked but -3, -4, -8, -10 all failed.
 
-Added gate logging to eval function (`_analyze_gate_values`): measures mean gate strength on store vs filler vs recall chunks. Currently retraining hard gate (bias=-5) with logging to verify hypothesis that gate learns store≫filler differentiation.
+### Key Discovery 8: The 55.6% Result Was a Fluke (Confirmed by Multi-Seed)
 
-Preliminary result from a short (10-epoch) analysis run: gate saturated to ~1.0 everywhere because the model never found the "use M" basin. Confirms that gate differentiation only emerges when the model successfully learns to use M — the gate and retrieval are co-dependent.
+**Multi-seed test** (gate + 100x, bias=-5, 4 pairs):
+
+| Seed | 4-pair Recall |
+|---|---|
+| 42 (original) | **55.6%** |
+| 1 | 0.6% |
+| 2 | 0.9% |
+| 3 | 0.5% |
+| 4 | 0.7% |
+
+**The 55.6% was a lucky seed.** 4/4 new seeds failed at chance level. The optimization landscape is the fundamental bottleneck — the "use M" basin is extremely rare regardless of gate bias.
+
+### Key Discovery 9: Gate Analysis — Failed Models Learn Inverted Gate
+
+Gate values from a trained model that failed (1.3% recall, bias=-5):
+
+| Chunk type | Gate value |
+|---|---|
+| STORE | 0.019 (low — suppresses writes!) |
+| FILLER | 0.999 (high — writes everything!) |
+| RECALL | 0.016 (low) |
+
+**Opposite of our hypothesis.** Failed models learn to suppress STORE writes and amplify filler writes. The gate only learns the correct pattern (store≫filler) when the model successfully finds the "use M" basin — which almost never happens.
+
+### Alternative Architectures Tested
+
+| Architecture | 4-pair Recall | Notes |
+|---|---|---|
+| **Hopfield** (softmax retrieval, 32 slots) | 1.1% | Same optimization problem |
+| **Slot** (content-based addressing, 32 slots) | running | |
+
+**Hopfield failed** — same as M-matrix. The problem is not retrieval quality (linear vs softmax) but that the optimizer never discovers how to use memory at all. Softmax retrieval is theoretically better (exponential capacity) but can't help if the model doesn't learn to write meaningful content.
+
+### The Core Problem: Optimization, Not Architecture
+
+Every architecture and fix we've tried fails for the same reason: the "ignore M" local minimum is much easier to find than the "use M" basin. The model can always minimize loss by:
+1. Predicting filler tokens from context (easy, dominates the loss)
+2. Ignoring recall tokens (small fraction of total loss, even with 100x weight)
+
+**This is not an architecture problem — it's an optimization problem.** Changing retrieval (Hopfield), write rules (delta), key matching (tied Q=K), or gate bias doesn't help because the optimizer never even tries to use M.
 
 ### Currently Running Experiments
 
-1. **Hard gate bias=-8, 4 pairs** — ~31% done. Testing if even harder suppression improves on 55.6%
-2. **Hard gate bias=-10, 4 pairs** — ~31% done. Near-zero filler writes
-3. **Hard gate bias=-5, 2 pairs** — ~42% done. Sanity check (should beat 94.4% from normal gate)
-4. **Hard gate bias=-5, 4 pairs + gate analysis** — ~12% done. Re-run with gate value logging to understand what the gate learns
+**New approach: force M usage through training tricks:**
 
-### High Variance Problem
-
-Same config gives wildly different results depending on random init:
-- 2 pairs uniform: 1.1% vs 47.7% (different loss modes but same arch)
-- 8 pairs key-fix: 44.6% vs original 5.4%
-- Original predictive: 100% vs 1.2%
-
-The optimization landscape has multiple basins. Most don't involve M. The model easily falls into "ignore M" local minima.
+1. **Recall bottleneck** — Zero out transformer hidden states at recall positions. M becomes the ONLY path for recall information. Forces the optimizer to use M.
+2. **Memory supervision** — Add 10x extra CE loss directly on recall positions. Stronger gradient signal for M.
+3. **Both combined** — Bottleneck + supervision.
+4. **Slot memory** (32 slots) — Still running from earlier batch.
 
 ### Open Questions
 
 1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair.**
-2. ~~Does M scale to multiple pairs?~~ **Partially — hard gate gets 55.6% on 4 pairs.**
-3. ~~Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?~~ **Hard gate helps significantly (55.6%). Tied Q=K and delta rule hurt.**
-4. Can harder gates (bias=-8, -10) push 4-pair recall higher?
-5. What gate pattern does a trained model learn? (store≫filler hypothesis)
-6. Is the problem fundamentally optimization (need more seeds/training) or architectural?
-7. Does predictive M offer advantages on anticipation/planning tasks?
-8. Multi-timescale memory for agent planning (long-term vision)
+2. ~~Does M scale to multiple pairs?~~ **No — 55.6% was a fluke. Fails consistently at 4+ pairs.**
+3. ~~Can tied Q=K, delta rule, or hard gate solve 4-pair retrieval?~~ **No. All fail or are seed-dependent.**
+4. ~~Can Hopfield (softmax retrieval) solve it?~~ **No. Same optimization problem.**
+5. Can information bottleneck (forcing M usage) solve the optimization problem?
+6. Can direct memory supervision provide enough gradient signal?
+7. If bottleneck works: does it generalize when the bottleneck is removed?
+8. Does predictive M offer advantages on anticipation/planning tasks?
+9. Multi-timescale memory for agent planning (long-term vision)
 
 ---
-*Last updated: 2026-03-12*
+*Last updated: 2026-03-13*
