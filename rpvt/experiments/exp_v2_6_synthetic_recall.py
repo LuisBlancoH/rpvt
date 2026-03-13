@@ -313,6 +313,7 @@ def train_and_eval(
     whole_doc=False, recall_loss_weight=1.0, recall_only_loss=False,
     curriculum_train_data=None,
     recall_bottleneck=False, memory_supervision=False,
+    two_phase=False,
 ):
     """Train and evaluate.
 
@@ -325,8 +326,36 @@ def train_and_eval(
 
     curriculum_train_data: if provided, train on this (1-pair) dataset for the
     first half of epochs, then switch to train_dataset (N-pair) for the rest.
+
+    two_phase: Phase 1 (first half of epochs): freeze transformer, train only
+    memory parameters. Phase 2 (second half): unfreeze everything.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # Identify memory vs transformer parameters for two-phase training
+    memory_param_names = set()
+    if two_phase:
+        for name, module in model.named_modules():
+            if isinstance(module, (FastWeightMemory, AlternativeMemoryWrapper)):
+                for pname, _ in module.named_parameters():
+                    memory_param_names.add(f"{name}.{pname}")
+            # Also catch memory modules from hopfield/slot
+            from rpvt.model.hopfield_memory import HopfieldMemory
+            from rpvt.model.slot_memory import SlotMemory
+            if isinstance(module, (HopfieldMemory, SlotMemory)):
+                for pname, _ in module.named_parameters():
+                    memory_param_names.add(f"{name}.{pname}")
+
+        # Phase 1: freeze everything except memory
+        for name, param in model.named_parameters():
+            if name not in memory_param_names:
+                param.requires_grad = False
+
+        n_frozen = sum(1 for n, p in model.named_parameters() if not p.requires_grad)
+        n_trainable = sum(1 for n, p in model.named_parameters() if p.requires_grad)
+        print(f"  Two-phase: Phase 1 — {n_trainable} memory params trainable, {n_frozen} transformer params frozen")
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01
+    )
 
     if whole_doc:
         total_steps = len(train_dataset.doc_sequences) * num_epochs
@@ -353,7 +382,30 @@ def train_and_eval(
     train_losses = []
     start_time = time.time()
 
+    phase_switch_epoch = num_epochs // 2
+    phase_switched = False
+
     for epoch in range(num_epochs):
+        # Two-phase: unfreeze transformer at halfway point
+        if two_phase and epoch == phase_switch_epoch and not phase_switched:
+            print(f"  [{model_name}] === PHASE 2: Unfreezing transformer ===")
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+            # Rebuild optimizer with all parameters
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr * 0.1, weight_decay=0.01)
+            # Reset scheduler for phase 2
+            remaining_steps = total_steps - global_step
+            def lr_schedule_p2(step):
+                warmup = 100
+                if step < warmup:
+                    return step / warmup
+                progress = (step - warmup) / max(remaining_steps - warmup, 1)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_p2)
+            n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            print(f"  [{model_name}] All {n_trainable} params trainable, lr={lr * 0.1:.1e}")
+            phase_switched = True
+
         # Curriculum: use 1-pair data for first half, N-pair for second half
         if curriculum_train_data is not None and epoch < curriculum_switch_epoch:
             active_dataset = curriculum_train_data
@@ -825,6 +877,8 @@ def main():
                         help="Zero out transformer hidden states at recall positions, forcing M usage")
     parser.add_argument("--memory-supervision", action="store_true",
                         help="Add direct supervision loss on recall positions (10x extra CE loss)")
+    parser.add_argument("--two-phase", action="store_true",
+                        help="Phase 1: freeze transformer, train only memory. Phase 2: unfreeze all.")
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--n-keys", type=int, default=32)
     parser.add_argument("--n-values", type=int, default=64)
@@ -965,6 +1019,7 @@ def main():
         curriculum_train_data=curriculum_train_data,
         recall_bottleneck=args.recall_bottleneck,
         memory_supervision=args.memory_supervision,
+        two_phase=args.two_phase,
     )
 
     results["config"] = vars(args)
