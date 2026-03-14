@@ -2,86 +2,160 @@
 
 ## What This Is
 
-Research project building **architectural-level memory for LLM agents**. Not scaffolding — we modify the model's forward pass to add a differentiable external memory module (Hopfield memory) that persists across chunks of text.
+Research project building **architectural-level memory for LLM agents**. Not scaffolding — we modify the model's forward pass to add a differentiable external memory module that persists across chunks of text. The model processes text in chunks, with memory as the ONLY cross-chunk information channel.
 
 **Broader vision**: Agents that can plan, learn, evaluate, and have goals. Memory (M) is the first building block. Five minimal mechanisms: prediction, error signal, persistent goal state, multiple timescales, recurrence.
 
 **Philosophy**: Work at architecture level (not scaffolding), take brain *principles* not implementation details, bitter lesson (make mechanisms learnable, don't hard-code), verify foundation before building more.
 
-## Current Architecture
+**Owner**: Luis Blanco, SWE at Google, independent ML researcher.
 
-- **Base model**: Qwen2.5-3B (frozen, bf16) — can also use 1.5B for faster iteration
-- **LoRA**: rank 16 on q_proj, v_proj
-- **HopfieldMemory**: Attached at layer 18/36 (middle). Slot-based memory with:
-  - W_gate (learned write gate) — controls what gets stored
-  - W_key, W_value — project hidden states for storage
-  - W_query — project hidden states for retrieval
-  - K_mem, V_mem — the actual memory banks (n_slots x memory_size)
-  - Softmax attention retrieval with learned temperature (beta)
-  - W_out — project retrieved values back to residual stream
+## Current Working Architecture (v3.2 cross-attention)
+
+**This is the architecture that works. Previous additive injection approaches all failed.**
+
+- **Base model**: Qwen2.5-3B (frozen, bf16) — can also use 1.5B for faster iteration on 3080 Ti
+- **LoRA**: rank 16 on q_proj, v_proj (3.7M params)
+- **MemoryBank** (`rpvt/model/cross_attention_memory.py`): Stores gated hidden states
+  - W_gate: learned write gate (bias=-2.0) — controls what gets stored
+  - Circular buffer of n_slots=64 hidden state vectors (raw, no projection)
+  - Only 2,049 trainable params (just the gate)
+- **WriteWrapper**: Wraps layer 18 — passes output through unchanged, then writes gated hidden states to MemoryBank
+- **MemoryAugmentedAttention**: Replaces layer 19's self_attn — concatenates memory hidden states as extra KV pairs before attention computation
+  - Projects memory through layer 19's own k_proj/v_proj (with LoRA)
+  - No RoPE on memory KVs (content-based, position-independent retrieval)
+  - Model's own attention mechanism decides whether to attend to memory
 - **Per-chunk processing**: Each chunk is a separate `model()` call. Memory is the ONLY cross-chunk information channel.
+
+**Result**: 42.5% token accuracy (vs 15.5% no-memory, 10.2% untrained). First working memory on a pretrained model.
 
 ## Key Files
 
-- `rpvt/model/hopfield_memory.py` — HopfieldMemory module
-- `rpvt/experiments/exp_v3_2_nlp_recall.py` — Current NLP recall experiment (SQuAD + synthetic)
-- `rpvt/experiments/exp_v3_1_pretrained_recall.py` — Synthetic token recall (has MemoryWrapper, build_model, etc.)
-- `results/FINDINGS.md` — Comprehensive experiment findings (20 key discoveries)
+- `rpvt/model/cross_attention_memory.py` — MemoryBank, WriteWrapper, MemoryAugmentedAttention (THE WORKING APPROACH)
+- `rpvt/model/hopfield_memory.py` — HopfieldMemory module (additive injection — DOES NOT WORK on pretrained models)
+- `rpvt/experiments/exp_v3_2_nlp_recall.py` — Current NLP recall experiment (SQuAD + synthetic data)
+- `rpvt/experiments/exp_v3_1_pretrained_recall.py` — Has build_model(), MemoryWrapper, reset_memories, etc.
+- `results/FINDINGS.md` — Comprehensive experiment findings (23 key discoveries)
 
 ## What Works
 
-1. **Write gating**: Gate reliably learns to discriminate passage from filler (2.6x ratio)
-2. **Attention alignment**: 100% of retrieval attention falls on passage slots (not filler)
-3. **Per-chunk processing**: Forces genuine memory dependence (LoRA-only baseline at chance: 10.2%)
+1. **Cross-attention memory injection**: Memory as extra KV pairs in attention → 42.5% (vs 15.5% no-memory)
+2. **Write gating**: Gate reliably discriminates passage from filler (2.6x ratio on NL text)
+3. **Per-chunk processing**: Forces genuine memory dependence (LoRA-only at chance: 10.2%)
 4. **Answer-only loss**: Loss computed only on answer tokens after "A:" markers — no dilution
+5. **Synthetic facts with truly unique entities**: Random names, codes, cities prevent template memorization
 
-## What Doesn't Work (The Core Bottleneck)
+## What Does NOT Work (Critical Lessons)
 
-**The memory module adds zero value.** Controlled experiment: training LoRA without memory gives 15.5% — identical to all memory configs (~14.8%). The +5% over untrained baseline (10.2%) is entirely from LoRA learning on passage/filler LM loss. Memory output is ignored.
+1. **Additive residual injection (W_out → residual stream)**: Pretrained models ignore/suppress the signal. Even with full LoRA (30M params on all linear layers), the model actively learns to suppress memory. The residual stream has a tightly learned distribution — foreign signals are noise.
+2. **Increasing memory_size**: 256, 1024, 2048 all give identical results — not a capacity problem
+3. **Learned extraction queries (n_extract=4)**: Multi-slot writes don't help when injection is broken. Should be revisited with cross-attention.
+4. **SQuAD as benchmark**: Parametric knowledge dominates (55.5% baseline). Use synthetic facts.
+5. **Small entity pools**: LoRA memorizes template mappings. Use truly random names/codes/cities.
 
-**Root cause**: Additive W_out injection into the residual stream of a frozen model doesn't work. Layers 19-35 were never trained to interpret memory signals. LoRA rank 16 on q_proj/v_proj is insufficient to adapt.
+## Experiment History (Condensed)
 
-| Config | Token Acc | Memory adds |
-|---|---|---|
-| No memory, trained LoRA | 15.5% | N/A |
-| Memory (any size/config) | ~14.8% | 0% |
+### v2.6: Small model from scratch
+- Proved Hopfield retrieval works for 1 pair (100% with loss weighting)
+- Scales poorly to 4+ pairs (25.8% best with two-phase training at 40 epochs)
+- Key insight: two-phase training (freeze transformer, train memory first) solves gate learning
+- Additive injection works when training from scratch (model learns WITH memory)
 
-What DOES work: gate discrimination (2.6x passage/filler), attention alignment (100% on passage slots). The read/write pipeline is functional — the injection point is broken.
+### v3.1: Pretrained model + synthetic tokens
+- Per-chunk processing works — memory is genuinely the only information channel
+- Gate learns perfectly (1.8 billion x store/filler ratio)
+- But retrieval fails — W_query/W_key alignment doesn't learn
 
-## Experiment History Summary
+### v3.2: Pretrained model + NLP recall
+- **SQuAD**: contaminated by parametric knowledge (55.5% baseline)
+- **Synthetic v1** (small pools): template memorization (77.4% no-memory = 77.3% with memory)
+- **Synthetic v2** (truly unique facts): proper benchmark (10.2% baseline)
+- **Attention supervision**: proved attention already 100% on passage slots — never the bottleneck
+- **Memory_size sweep**: 256=1024=2048, all ~14.8% — value dimensionality not the issue
+- **No-memory trained control**: 15.5% — proved memory contributes zero with additive injection
+- **Full LoRA (30M params)**: model SUPPRESSES memory (attn→0%)
+- **BREAKTHROUGH: Cross-attention injection**: 42.5% at epoch 5 (15.4→20→30.3→39.5→42.5)
 
-- **v2.6**: Small transformer from scratch, synthetic store/recall. Proved basic Hopfield retrieval works for 1 pair. Scales poorly to 4+ pairs.
-- **v3.1**: Pretrained model (Qwen2.5-3B) + synthetic token recall. Per-chunk processing works but retrieval alignment appears stuck.
-- **v3.2**: Pivoted to NLP recall (SQuAD + synthetic facts). Discovered:
-  - SQuAD contaminated by parametric knowledge (55.5% baseline)
-  - Synthetic facts with truly unique entities work (10.2% baseline)
-  - Gate works (2.6x), attention works (100%), but memory output ignored
-  - memory_size doesn't matter (256=1024=2048)
-  - Learned extraction queries (n_extract=4) don't matter
-  - **Critical**: no-memory trained LoRA matches memory configs → W_out injection is broken
+## Synthetic Data Task (Current Benchmark)
 
-## Next Steps to Try (Injection Problem)
+Generate passages with truly unique facts (random names, random 3-digit codes, random cities). Model sees passage in early chunks, filler chunks (WikiText), then QA chunk. Must answer from memory.
 
-1. **LoRA at memory injection layer**: Add LoRA to layers 18-20 so the model can learn to use memory signals
-2. **Cross-attention injection**: Replace additive W_out with a cross-attention layer that queries memory
-3. **Output-space injection**: Inject at logits level instead of hidden state level
-4. **Gated injection**: `output = x + gate * W_out(retrieved)` where gate is learned per-token
-5. **Train from scratch on smaller model**: Eliminates the frozen-model problem entirely
+```
+Passage: "Balcorfen Torushvel was a researcher at the Criho Institute in Xilob.
+Their work on gomilu dynamics produced result code 847. The project started in
+1923 and generated output code 412..."
+
+Q: What was Balcorfen Torushvel's result code? A: 847
+Q: Where did Balcorfen Torushvel work? A: Xilob
+Q: When did Balcorfen Torushvel's project start? A: 1923
+```
+
+Baseline (no memory, per-chunk): 10.2%. No-memory trained LoRA: 15.5%. Cross-attention memory: 42.5%.
+
+## Next Steps (Priority Order)
+
+1. **More training**: Run cross-attention for 10-20 epochs to find the accuracy ceiling
+2. **Learned extraction + cross-attention**: Combine the n_extract queries with cross-attention injection (the extraction idea is sound, it just couldn't be tested when injection was broken)
+3. **Scaling tests**: More QA pairs per passage, longer gaps, harder questions
+4. **Attention analysis**: What do the cross-attention patterns look like? Does the model attend to specific memory slots for specific questions?
+5. **Hierarchical compression**: Compress chunks, then compress compressed chunks — same extraction mechanism at multiple timescales
+6. **Multi-hop reasoning**: Questions that require combining facts from multiple passages
 
 ## Environment
 
-- Python: use system python or venv with torch, transformers, peft, datasets
-- GPU: works on 12GB+ (3080 Ti with 1.5B model, or 24GB+ for 3B)
+- Python: use system python or venv with `torch`, `transformers`, `peft`, `datasets`
+- GPU: works on 12GB+ (3080 Ti with 1.5B model, 24GB+ for 3B)
+- On A100 40GB: can run 2 experiments in parallel with 3B model
 - Always push to GitHub after code changes
-- Update results/FINDINGS.md with experiment outcomes
+- Update `results/FINDINGS.md` with experiment outcomes
+- Use `--memory-mode cross_attn` flag for the working architecture
+- Use `--data-source synthetic` for the proper benchmark (not squad)
 
-## Synthetic Data Task
+## Running Experiments
 
-The current benchmark: generate passages with truly unique facts (random names, random 3-digit codes, random cities). Model sees passage in early chunks, filler chunks (WikiText), then QA chunk. Must answer from memory.
+```bash
+# Cross-attention memory (THE WORKING APPROACH)
+python -m rpvt.experiments.exp_v3_2_nlp_recall \
+  --data-source synthetic \
+  --memory-mode cross_attn \
+  --epochs 5 \
+  --n-train 500 \
+  --n-eval 100 \
+  --output-dir results/exp_v3_2_cross_attn
+
+# No-memory baseline (for comparison)
+python -m rpvt.experiments.exp_v3_2_nlp_recall \
+  --data-source synthetic \
+  --no-memory \
+  --epochs 5 \
+  --output-dir results/exp_v3_2_no_memory
+
+# For 1.5B model (fits on 3080 Ti 12GB)
+python -m rpvt.experiments.exp_v3_2_nlp_recall \
+  --model-name Qwen/Qwen2.5-1.5B \
+  --data-source synthetic \
+  --memory-mode cross_attn \
+  --epochs 5 \
+  --output-dir results/exp_v3_2_cross_attn_1.5b
+```
+
+## Architecture Diagram
 
 ```
-Passage: "Balcorfen Torushvel was a researcher at the Criho Institute in Xilob..."
-Q: What was Balcorfen Torushvel's result code? A: 847
-```
+Input text split into chunks: [Passage] [Filler1] [Filler2] ... [QA]
 
-Baseline (no memory, per-chunk): 10.2%. Current best with memory: ~14-15%.
+For each chunk:
+  Layers 0-17: frozen Qwen + LoRA
+  Layer 18 (WriteWrapper):
+    → normal layer forward
+    → gate(hidden_states) → store in MemoryBank circular buffer
+  Layer 19 (MemoryAugmentedAttention):
+    → compute Q, K, V from current chunk
+    → project stored memories through k_proj, v_proj (no RoPE)
+    → concatenate: K = [mem_K | chunk_K], V = [mem_V | chunk_V]
+    → standard softmax attention (model decides what to attend to)
+  Layers 20-35: frozen Qwen + LoRA
+  → output logits
+
+Loss: cross-entropy on answer tokens only (after "A:" markers)
+```
