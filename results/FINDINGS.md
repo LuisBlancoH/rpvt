@@ -253,12 +253,94 @@ Per-chunk joint training (LoRA + Memory, 5 epochs, 500 docs):
 
 The gate learns the perfect write pattern immediately — far cleaner than any v2.6 result. But recall accuracy is 0%. The bottleneck is **query-key alignment**: W_query applied to RECALL hidden states doesn't match W_key applied to STORE hidden states. The pretrained model produces very different representations for the same key token in different contexts.
 
-### Currently Running Experiments
+### Key Discovery 15: Shared Q=K Init and Longer Training Both Fail
 
-**Shared Q=K initialization** (W_query initialized as copy of W_key, then trained independently):
+| Experiment | Epochs | Recall | Gate Pattern |
+|---|---|---|---|
+| Joint (baseline) | 5 | 0% | Perfect (store=0.71, filler=0.000) |
+| Shared Q=K init | 10 | 0% | Collapsed (all gates → 0.000) |
+| Random Q/K, more training | 10 | 1% | Saturated (all gates → 0.984) |
 
-1. **Shared init** (10 epochs, 500 docs) — tests if alignment bootstrapping enables retrieval
-2. **Random init baseline** (10 epochs, 500 docs) — control with more training
+**The good gate pattern is transient.** 5 epochs produces perfect gate, but 10 epochs destroys it in both init modes. Shared Q=K init makes it worse — gates collapse to zero immediately.
+
+### Key Discovery 16: Hidden State Diagnostic — Signal Exists But Is Weak
+
+Analyzed cosine similarity of pretrained hidden states at layer 18 between STORE and RECALL chunks:
+
+| Comparison | Cosine Similarity |
+|---|---|
+| Same key token, store vs recall context | 0.747 (std 0.034) |
+| Different key tokens, store vs recall | 0.538 (std 0.042) |
+| **Separation** | **0.209** |
+| Same key, same context, diff docs | ~1.0 |
+| Different keys, same context | 0.64-0.70 |
+
+The pretrained model *does* encode key identity across contexts (0.209 separation), but the signal is modest. Within-context distinctiveness is strong (~1.0 for same key), but cross-context similarity is high baseline (~0.5+). A learned projection should amplify this, but the optimization landscape prevents it.
+
+### Pivot: Synthetic Task → Natural Language (v3.2)
+
+**Root cause of v3.1 failure**: The synthetic recall task has a fundamental loss dilution problem — only 1 token per document requires memory. Even with 100x weighting, the gradient signal is dominated by filler/padding prediction. The pretrained model is too competent at filler prediction, leaving no gradient pressure for memory retrieval.
+
+**Solution**: Switch to SQuAD-based extractive QA where:
+- Loss is computed ONLY on answer tokens (no dilution by construction)
+- Multiple QA pairs per passage → 15+ answer tokens per document (vs 1)
+- Natural language plays to pretrained model's strengths
+- Per-chunk processing still makes memory the only cross-chunk channel
+
+---
+
+## v3.2: Natural Language Recall (SQuAD + Hopfield Memory)
+
+**Setup**: Qwen2.5-3B (frozen, bf16) + LoRA (rank 16) + HopfieldMemory (256-dim, 64 slots) at layer 18/36. Per-chunk processing (chunk_size=128).
+
+**Document structure**:
+- 1-4 passage chunks (SQuAD context)
+- 2-6 filler chunks (WikiText paragraphs)
+- 1 QA chunk: "Q: ... A: ... Q: ... A: ..." (3 QA pairs)
+
+Loss = answer-only (masked cross-entropy on answer tokens only).
+
+### Key Discovery 17: Memory Adds Nothing on SQuAD — Parametric Knowledge Dominates
+
+| Condition | Best Token Accuracy | Final Token Accuracy |
+|---|---|---|
+| No memory (LoRA only) | 57.1% (ep 2) | 54.8% (ep 3) |
+| Memory + LoRA (bias=-2) | 57.0% (ep 2) | 51.6% (ep 5) |
+| Memory + LoRA (bias=0) | 57.0% (ep 1) | 54.1% (ep 3) |
+| Untrained baseline | 55.5% | — |
+
+**All three conditions are identical.** The untrained model already gets 55.5% from parametric knowledge — Qwen has seen SQuAD during pretraining. LoRA improves QA formatting slightly (+1.5%), then overfits. Memory has zero contribution.
+
+**Gate values**: Passage=0.53, Filler=0.48 (ratio=1.1x). The gate cannot distinguish passage from filler — both are natural language text, unlike the synthetic task where STORE chunks had unique tokens.
+
+**Root cause**: The task doesn't genuinely require memory. Most SQuAD answers are in the model's weights. Memory needs a task where the **only** way to answer is to retrieve from the passage.
+
+### Key Discovery 18: Template Memorization With Small Pools
+
+First synthetic generator used small name/field/city pools (30×20×15). LoRA memorized the template mapping without needing memory:
+
+| Condition | Synthetic v1 (small pools) |
+|---|---|
+| Untrained baseline | 34.8% |
+| Memory + LoRA | 77.3% |
+| **No memory (LoRA only)** | **77.4%** (identical!) |
+
+LoRA learned to predict answers from question structure alone. Not a memory result.
+
+### Key Discovery 19: Truly Unique Facts — Gate Learns, Retrieval Fails
+
+Second synthetic generator: random names, random 3-digit codes, random cities. Every fact is unique per document. No template memorization possible.
+
+| Condition | Token Accuracy | Gate Ratio |
+|---|---|---|
+| Untrained baseline | 10.2% | — |
+| Memory + LoRA (5 ep) | **13.5%** | **2.6x** (passage=0.63, filler=0.24) |
+
+**Two findings:**
+1. **Gate learned to discriminate** passage from filler on natural language (2.6x ratio vs 1.1x on SQuAD). Synthetic passages have different statistics than WikiText filler.
+2. **Retrieval still fails** — only +3.3% over baseline despite correct gating. Same problem as v3.1: W_query/W_key alignment doesn't learn.
+
+**Pattern across all experiments**: The gate is easy to train. Retrieval alignment is the fundamental bottleneck. This holds for both synthetic token recall (v3.1) and natural language recall (v3.2).
 
 ### Open Questions
 
@@ -266,9 +348,10 @@ The gate learns the perfect write pattern immediately — far cleaner than any v
 2. ~~Does M scale to multiple pairs?~~ **Two-phase + Hopfield gets 25.8% at 40ep.**
 3. ~~Can three-phase improve on two-phase?~~ **No — pretrained transformer hurts M learning.**
 4. ~~Does per-chunk processing make memory necessary?~~ **Yes — LoRA alone at chance.**
-5. Can shared Q=K init solve the retrieval alignment problem?
-6. Does the pretrained model need LoRA adaptation at the memory layer specifically?
-7. Once retrieval works: scale to 4+ pairs, then predictive memory for planning
+5. ~~Can shared Q=K init solve alignment?~~ **No — gates collapse.**
+6. Does answer-only loss on NL QA produce memory-dependent retrieval?
+7. Does the gate learn passage vs filler discrimination on natural text?
+8. Scale to harder QA: more pairs, longer gaps, multi-hop reasoning
 
 ---
 *Last updated: 2026-03-13*
