@@ -373,16 +373,17 @@ Definitive controlled experiment: trained LoRA for 5 epochs **without memory** a
 | Memory, mean-pool (1024-dim) | 15.0% | 0% |
 | Memory, mean-pool (2048-dim) | 14.9% | 0% |
 | Memory, n_extract=4 | 14.8% | 0% |
+| **Memory, full LoRA (all linear, 30M params)** | **14.4%** | **0% (actively ignored)** |
 
-Furthermore, 100% vs 3% attention on passage slots makes no difference — the W_out output is noise either way.
+Furthermore, 100% vs 3% attention on passage slots makes no difference — the W_out output is noise either way. With full LoRA (6 targets, 30M params, 0.99% of model), attn_passage dropped from 1.4% → 0.0% — the model actively learned to IGNORE memory.
 
-**Root cause**: The frozen model's layers 19-35 have never seen memory signals in their residual stream. W_out (initialized to zero, trained) adds a signal, but downstream layers treat it as noise. LoRA rank 16 on q_proj/v_proj is insufficient to learn to interpret memory injections.
+**Root cause**: Additive residual injection is fundamentally incompatible with pretrained transformers. The model's residual stream has a learned distribution at each layer. Adding a foreign signal (even a small one) disrupts downstream processing. More LoRA capacity doesn't help — the model uses that capacity to suppress the memory signal, not utilize it.
 
 **Implications for architecture**:
-1. Additive residual injection into a frozen pretrained model doesn't work
-2. Need LoRA specifically at/after the memory injection layer to help the model use memory
-3. Or need a different injection mechanism (cross-attention, gated addition, output-space injection)
-4. Or need to train from scratch / full fine-tune (not practical at 3B scale)
+1. Additive residual injection doesn't work, even with full LoRA on all linear layers
+2. Need cross-attention injection: memory slots become extra KV pairs in transformer attention
+3. Or train from scratch so the model learns with memory from the start
+4. The extraction queries and gate mechanisms are sound — revisit once injection works
 
 ### Key Discovery 22: Learned Extraction Queries (n_extract=4)
 
@@ -402,9 +403,10 @@ Result: same accuracy as mean-pooling. But this was moot since Discovery 21 show
 8. ~~Is attention alignment the bottleneck?~~ **No — 100% attention on passage slots already.**
 9. ~~Does larger memory_size help?~~ **No — 256/1024/2048 all identical.**
 10. ~~Does learned extraction (multi-slot) help?~~ **No — injection path itself is broken.**
-11. Can LoRA at the memory layer help the model use memory output?
-12. Does cross-attention injection (instead of additive) work better?
-13. Does injecting at the output/logits level bypass the frozen-model problem?
+11. ~~Can full LoRA (all linear layers) help the model use memory output?~~ **No — model uses extra capacity to suppress memory.**
+12. Does cross-attention injection (memory as extra KV pairs in attention) work?
+13. Does training from scratch on a smaller model with cross-attention injection work?
+14. Can the learned extraction queries + gate be combined with cross-attention injection?
 
 ---
 *Last updated: 2026-03-14*
