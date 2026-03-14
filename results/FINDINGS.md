@@ -404,9 +404,38 @@ Result: same accuracy as mean-pooling. But this was moot since Discovery 21 show
 9. ~~Does larger memory_size help?~~ **No — 256/1024/2048 all identical.**
 10. ~~Does learned extraction (multi-slot) help?~~ **No — injection path itself is broken.**
 11. ~~Can full LoRA (all linear layers) help the model use memory output?~~ **No — model uses extra capacity to suppress memory.**
-12. Does cross-attention injection (memory as extra KV pairs in attention) work?
-13. Does training from scratch on a smaller model with cross-attention injection work?
-14. Can the learned extraction queries + gate be combined with cross-attention injection?
+12. ~~Does cross-attention injection work?~~ **YES — 42.5% vs 15.5% no-memory. BREAKTHROUGH.**
+
+### Key Discovery 23: Cross-Attention Memory Injection — First Working Memory on Pretrained Model
+
+Replaced additive W_out injection with cross-attention: memory hidden states become extra KV pairs in layer 19's attention. The model's own attention mechanism decides whether to attend to memory.
+
+| Epoch | Token Accuracy | Improvement over no-memory |
+|---|---|---|
+| 1 | 15.4% | +0% (warming up) |
+| 2 | 20.0% | +4.5% |
+| 3 | 30.3% | +14.8% |
+| 4 | 39.5% | +24.0% |
+| **5** | **42.5%** | **+27.0%** |
+
+**Architecture**: Write@layer 18 (gate → store hidden states in MemoryBank), Read@layer 19 (MemoryAugmentedAttention concatenates memory KVs before softmax). No RoPE on memory KVs (content-based, position-independent). Only 2,049 new params (gate only) — reuses model's own k_proj/v_proj via LoRA.
+
+**Why it works**: Instead of adding a foreign signal to the residual stream (which the model ignores/suppresses), cross-attention uses the model's existing attention mechanism. The model already knows how to attend to KV pairs — memory KVs are just more KV pairs. LoRA on q_proj/v_proj learns to query/value-project memory naturally.
+
+**Implications**:
+1. The memory architecture is validated — gate + storage + cross-attention retrieval works
+2. Next: add learned extraction queries to improve what gets stored
+3. Next: test with more QA pairs, longer gaps, harder tasks
+4. Next: hierarchical compression (compress chunks, then compress compressed chunks)
+
+### Open Questions (Updated)
+
+1. Does learned extraction + cross-attention improve further?
+2. How does accuracy scale with more QA pairs per passage?
+3. How does accuracy degrade with longer gaps (more filler chunks)?
+4. Can this generalize to multi-hop reasoning?
+5. Does hierarchical memory compression work?
+6. What does the attention pattern look like — does it attend to specific memory slots for specific questions?
 
 ---
 *Last updated: 2026-03-14*
