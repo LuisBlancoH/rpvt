@@ -36,6 +36,7 @@ class HopfieldMemory(nn.Module):
         gate_bias: float = -2.0,
         w_out_std: float = 0.0,
         init_qk_shared: bool = False,
+        n_extract: int = 1,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -44,6 +45,7 @@ class HopfieldMemory(nn.Module):
         self.decay = decay
         self.beta = beta
         self.write_mode = write_mode
+        self.n_extract = n_extract
 
         # Projections
         self.W_key = nn.Linear(hidden_size, memory_size, bias=False)
@@ -66,6 +68,13 @@ class HopfieldMemory(nn.Module):
             self.W_gate = nn.Linear(hidden_size, 1, bias=True)
             nn.init.zeros_(self.W_gate.weight)
             nn.init.constant_(self.W_gate.bias, gate_bias)
+
+        # Learned extraction queries: k queries that cross-attend over chunk tokens
+        # to produce k diverse summary vectors instead of mean-pooling
+        if n_extract > 1:
+            self.extract_queries = nn.Parameter(
+                torch.randn(n_extract, hidden_size) * 0.02
+            )
 
         # Learnable inverse temperature
         self.log_beta = nn.Parameter(torch.tensor(float(beta)).log())
@@ -150,36 +159,74 @@ class HopfieldMemory(nn.Module):
             # ── WRITE: add chunk's key-values to buffer ──
             k_chunk = key[:, chunk_start:chunk_end, :]
             v_chunk = value[:, chunk_start:chunk_end, :]
+            x_chunk = x_cast[:, chunk_start:chunk_end, :]  # raw hidden states for extraction
 
             if self.write_mode == "gate":
                 ws_chunk = gate_strengths[:, chunk_start:chunk_end, :]  # (batch, c_len, 1)
                 write_strength_log.append(ws_chunk.mean().item())
-                # Aggregate chunk into single k,v weighted by gate
-                weights = ws_chunk.squeeze(-1)  # (batch, c_len)
-                w_sum = weights.sum(dim=(0, 1)).clamp(min=1e-8)
-                k_agg = (k_chunk * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum  # (memory_size,)
-                v_agg = (v_chunk * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum
-                write_str = weights.mean().item()
+                write_str = ws_chunk.mean().item()
             else:
-                # Uniform: mean aggregate
-                k_agg = k_chunk.mean(dim=(0, 1))  # (memory_size,)
-                v_agg = v_chunk.mean(dim=(0, 1))
                 write_str = 1.0
-
-            k_agg = F.normalize(k_agg, dim=-1)
-            v_agg = F.normalize(v_agg, dim=-1)
 
             # Decay existing memories
             mem_strength = mem_strength * (self.decay ** c_len)
 
-            # Write to next slot (circular buffer) — no in-place ops for autograd
-            slot_idx = write_ptr % self.n_slots
-            mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)  # (n_slots,)
-            mask_2d = mask.unsqueeze(1)  # (n_slots, 1)
-            K_mem = K_mem * (1 - mask_2d) + mask_2d * k_agg.unsqueeze(0)
-            V_mem = V_mem * (1 - mask_2d) + mask_2d * v_agg.unsqueeze(0)
-            mem_strength = mem_strength * (1 - mask) + mask * write_str
-            write_ptr = write_ptr + 1
+            if self.n_extract > 1:
+                # Learned extraction: k queries cross-attend over chunk tokens
+                # to produce k diverse (key, value) pairs
+                # extract_queries: (k, hidden_size)
+                # x_chunk: (batch, c_len, hidden_size)
+                eq = self.extract_queries.to(dtype=param_dtype)  # (k, hidden_size)
+                extract_scores = torch.matmul(
+                    eq.unsqueeze(0), x_chunk.transpose(-1, -2)
+                ) / (self.hidden_size ** 0.5)  # (batch, k, c_len)
+
+                # Apply gate as mask on extraction attention
+                if self.write_mode == "gate":
+                    gate_mask = ws_chunk.squeeze(-1).unsqueeze(1)  # (batch, 1, c_len)
+                    extract_scores = extract_scores + torch.log(gate_mask.clamp(min=1e-8))
+
+                extract_weights = F.softmax(extract_scores, dim=-1)  # (batch, k, c_len)
+
+                # Extract k summary vectors in hidden space, then project to k/v
+                extracted = torch.matmul(extract_weights, x_chunk)  # (batch, k, hidden_size)
+                k_extracted = self.W_key(extracted)  # (batch, k, memory_size)
+                v_extracted = self.W_value(extracted)  # (batch, k, memory_size)
+                k_extracted = F.normalize(k_extracted, dim=-1)
+                v_extracted = F.normalize(v_extracted, dim=-1)
+
+                # Write k slots (mean across batch)
+                for ei in range(self.n_extract):
+                    k_agg = k_extracted[:, ei].mean(dim=0)  # (memory_size,)
+                    v_agg = v_extracted[:, ei].mean(dim=0)
+                    slot_idx = write_ptr % self.n_slots
+                    mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
+                    mask_2d = mask.unsqueeze(1)
+                    K_mem = K_mem * (1 - mask_2d) + mask_2d * k_agg.unsqueeze(0)
+                    V_mem = V_mem * (1 - mask_2d) + mask_2d * v_agg.unsqueeze(0)
+                    mem_strength = mem_strength * (1 - mask) + mask * write_str
+                    write_ptr = write_ptr + 1
+            else:
+                # Original: single aggregated write
+                if self.write_mode == "gate":
+                    weights = ws_chunk.squeeze(-1)  # (batch, c_len)
+                    w_sum = weights.sum(dim=(0, 1)).clamp(min=1e-8)
+                    k_agg = (k_chunk * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum
+                    v_agg = (v_chunk * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum
+                else:
+                    k_agg = k_chunk.mean(dim=(0, 1))
+                    v_agg = v_chunk.mean(dim=(0, 1))
+
+                k_agg = F.normalize(k_agg, dim=-1)
+                v_agg = F.normalize(v_agg, dim=-1)
+
+                slot_idx = write_ptr % self.n_slots
+                mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
+                mask_2d = mask.unsqueeze(1)
+                K_mem = K_mem * (1 - mask_2d) + mask_2d * k_agg.unsqueeze(0)
+                V_mem = V_mem * (1 - mask_2d) + mask_2d * v_agg.unsqueeze(0)
+                mem_strength = mem_strength * (1 - mask) + mask * write_str
+                write_ptr = write_ptr + 1
 
         # Store updated memory
         if self.persistent_grad:

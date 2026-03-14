@@ -237,7 +237,7 @@ def make_chunk_local_mask(seq_len, chunk_size, device):
 
 def build_model(model_name, device, memory_layer, memory_size, n_slots,
                 decay, gate_bias, lora_rank, lora_targets, no_memory=False,
-                no_lora=False, init_qk_shared=False):
+                no_lora=False, init_qk_shared=False, n_extract=1):
     """Load pretrained model, attach LoRA and Hopfield memory."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import get_peft_model, LoraConfig, TaskType
@@ -297,6 +297,7 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
             gate_bias=gate_bias,
             w_out_std=0.0,
             init_qk_shared=init_qk_shared,
+            n_extract=n_extract,
         ).to(device=device, dtype=torch.bfloat16)
 
         original_layer = layers[memory_layer]

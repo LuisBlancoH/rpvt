@@ -505,10 +505,11 @@ def train_and_eval(
                 is_qa_chunk = (chunk_idx == n_chunks - 1)
                 is_passage = chunk_idx < n_passage
 
-                # Track write_ptr before forward to know which slot this chunk writes to
+                # Track write_ptr before forward to know which slots this chunk writes to
                 if retrieval_loss_weight > 0 and mem is not None and is_passage:
-                    slot_idx = (mem.write_ptr % mem.n_slots).item()
-                    passage_slot_indices.append(slot_idx)
+                    for ei in range(mem.n_extract):
+                        slot_idx = ((mem.write_ptr + ei) % mem.n_slots).item()
+                        passage_slot_indices.append(slot_idx)
 
                 output = model(chunk_ids)
 
@@ -619,10 +620,11 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
                 chunk_ids = chunk.unsqueeze(0).to(device)
                 is_passage = chunk_idx < n_passage
 
-                # Track passage slots
+                # Track passage slots (n_extract slots per chunk)
                 if mem is not None and is_passage:
-                    slot_idx = (mem.write_ptr % mem.n_slots).item()
-                    passage_slot_indices.append(slot_idx)
+                    for ei in range(mem.n_extract):
+                        slot_idx = ((mem.write_ptr + ei) % mem.n_slots).item()
+                        passage_slot_indices.append(slot_idx)
 
                 output = model(chunk_ids)
 
@@ -788,6 +790,8 @@ def main():
     parser.add_argument("--decay", type=float, default=0.999)
     parser.add_argument("--gate-bias", type=float, default=-2.0)
     parser.add_argument("--init-qk-shared", action="store_true")
+    parser.add_argument("--n-extract", type=int, default=1,
+                        help="Number of extraction queries per chunk (1=mean-pool, >1=learned selection)")
 
     # LoRA
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -842,6 +846,7 @@ def main():
         no_memory=args.no_memory,
         no_lora=args.no_lora,
         init_qk_shared=args.init_qk_shared,
+        n_extract=args.n_extract,
     )
 
     # Create datasets
