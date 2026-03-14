@@ -510,7 +510,8 @@ def train_and_eval(
 
                 # Track write_ptr before forward to know which slots this chunk writes to
                 if retrieval_loss_weight > 0 and mem is not None and is_passage:
-                    for ei in range(mem.n_extract):
+                    n_ext = getattr(mem, 'n_extract', 1)
+                    for ei in range(n_ext):
                         slot_idx = ((mem.write_ptr + ei) % mem.n_slots).item()
                         passage_slot_indices.append(slot_idx)
 
@@ -625,7 +626,8 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
 
                 # Track passage slots (n_extract slots per chunk)
                 if mem is not None and is_passage:
-                    for ei in range(mem.n_extract):
+                    n_ext = getattr(mem, 'n_extract', 1)
+                    for ei in range(n_ext):
                         slot_idx = ((mem.write_ptr + ei) % mem.n_slots).item()
                         passage_slot_indices.append(slot_idx)
 
@@ -634,8 +636,8 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
                 is_qa_chunk = (chunk_idx == n_chunks - 1)
 
                 if is_qa_chunk:
-                    # Measure attention on passage slots
-                    if mem is not None and mem.last_attn_weights is not None and passage_slot_indices:
+                    # Measure attention on passage slots (Hopfield memory only)
+                    if mem is not None and hasattr(mem, 'last_attn_weights') and mem.last_attn_weights is not None and passage_slot_indices:
                         attn = mem.last_attn_weights.mean(dim=(0, 1))  # (n_slots,)
                         passage_attn = sum(attn[s].item() for s in passage_slot_indices if s < len(attn))
                         attn_on_passage_list.append(passage_attn)
@@ -720,12 +722,32 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
 
 def _analyze_gate_values(model, dataset, device, n_docs=50):
     """Analyze gate values by chunk type."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     memory_modules = []
     for module in model.modules():
         if isinstance(module, HopfieldMemory) and module.write_mode == "gate":
             memory_modules.append(module)
 
     if not memory_modules:
+        # Check for MemoryBank (cross-attention mode) — gate analysis via hook
+        banks = [m for m in model.modules() if isinstance(m, MemoryBank)]
+        if not banks:
+            return None
+        # For MemoryBank, do simplified gate analysis
+        bank = banks[0]
+        gate_by_type = {"passage": [], "filler": [], "qa": []}
+        for doc in dataset.documents[:n_docs]:
+            chunks = doc["chunks"]
+            n_chunks = len(chunks)
+            n_passage = doc["n_passage_chunks"]
+            gap = doc["gap"]
+            reset_memories(model)
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_ids = chunk.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    model(chunk_ids)
+                # We can't easily capture gate values mid-forward for MemoryBank
+                # Just return None for now
         return None
 
     gate_by_type = {"passage": [], "filler": [], "qa": []}

@@ -192,14 +192,17 @@ class MemoryAugmentedAttention(nn.Module):
         mem_states, n_active = self.memory_bank.get_active_memories()
         if n_active > 0:
             mem_hidden = mem_states.unsqueeze(0).to(dtype=hidden_states.dtype)  # (1, n_mem, hidden)
-            n_kv_heads = self.attn.num_key_value_heads
+            head_dim = self.attn.head_dim
+            # Derive n_kv_heads from k_proj output size
+            kv_dim = self.attn.k_proj.out_features
+            n_kv_heads = kv_dim // head_dim
 
             # Project through same k_proj, v_proj (with LoRA if applied)
             mem_k = self.attn.k_proj(mem_hidden)  # (1, n_mem, kv_dim)
             mem_v = self.attn.v_proj(mem_hidden)  # (1, n_mem, kv_dim)
 
-            mem_k = mem_k.view(1, n_active, n_kv_heads, self.attn.head_dim).transpose(1, 2)
-            mem_v = mem_v.view(1, n_active, n_kv_heads, self.attn.head_dim).transpose(1, 2)
+            mem_k = mem_k.view(1, n_active, n_kv_heads, head_dim).transpose(1, 2)
+            mem_v = mem_v.view(1, n_active, n_kv_heads, head_dim).transpose(1, 2)
 
             # Concatenate: [memory_KVs | regular_KVs]
             key_states = torch.cat(
