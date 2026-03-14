@@ -342,6 +342,25 @@ Second synthetic generator: random names, random 3-digit codes, random cities. E
 
 **Pattern across all experiments**: The gate is easy to train. Retrieval alignment is the fundamental bottleneck. This holds for both synthetic token recall (v3.1) and natural language recall (v3.2).
 
+### Key Discovery 20: Attention Alignment Is Already Perfect — Value Encoding Is the Bottleneck
+
+Replaced cosine retrieval loss with attention supervision: cross-entropy loss pushing Hopfield attention toward passage slots in K_mem. Result: **attention was already 100% on passage slots before any supervision.**
+
+| Metric | Value |
+|---|---|
+| Attention on passage slots | **100%** (epoch 1, no supervision needed) |
+| Token accuracy | 14.2% (vs 10.2% baseline) |
+| Cosine retrieval loss | Collapsed to trivial solution (0.001) — was solving a non-problem |
+| Attention supervision loss | 0.0000 after 50 steps — already satisfied |
+
+**Diagnosis updated:** The bottleneck is NOT attention alignment (Q/K matching). The memory correctly identifies and attends to passage slots. The problem is **value utilization**: the chunk-aggregated, normalized, 256-dim vectors in V_mem don't retain enough factual information to predict specific answers. A single V_mem slot can't simultaneously encode "code=847", "city=Xilob", "year=1923".
+
+**Implications for architecture:**
+1. Need higher-capacity value encoding (larger memory_size, or store raw hidden states)
+2. Need per-token storage instead of chunk aggregation (one slot per token, not per chunk)
+3. May need to bypass W_value projection and store raw hidden states
+4. The W_out projection (256→2048, initialized to zero) may be too constrained
+
 ### Open Questions
 
 1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair (v2.6).**
@@ -349,9 +368,12 @@ Second synthetic generator: random names, random 3-digit codes, random cities. E
 3. ~~Can three-phase improve on two-phase?~~ **No — pretrained transformer hurts M learning.**
 4. ~~Does per-chunk processing make memory necessary?~~ **Yes — LoRA alone at chance.**
 5. ~~Can shared Q=K init solve alignment?~~ **No — gates collapse.**
-6. Does answer-only loss on NL QA produce memory-dependent retrieval?
-7. Does the gate learn passage vs filler discrimination on natural text?
-8. Scale to harder QA: more pairs, longer gaps, multi-hop reasoning
+6. ~~Does answer-only loss on NL QA produce memory-dependent retrieval?~~ **Marginal — +4% over baseline.**
+7. ~~Does the gate learn passage vs filler discrimination on natural text?~~ **Yes — 2.6x ratio.**
+8. ~~Is attention alignment the bottleneck?~~ **No — 100% attention on passage slots already.**
+9. Can per-token storage (no chunk aggregation) retain enough factual info?
+10. Does storing raw hidden states (bypassing W_value) help?
+11. Does larger memory_size (1024+) improve value encoding?
 
 ---
-*Last updated: 2026-03-13*
+*Last updated: 2026-03-14*

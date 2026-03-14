@@ -306,10 +306,67 @@ class SQuADRecallDataset(Dataset):
         return self.documents[idx]
 
 
+def _get_memory_module(model):
+    """Get the HopfieldMemory module from the model."""
+    for module in model.modules():
+        if isinstance(module, HopfieldMemory):
+            return module
+    return None
+
+
+def _compute_attention_supervision_loss(mem, passage_slot_indices, device):
+    """Compute attention supervision loss on Hopfield memory.
+
+    After the QA chunk is processed, mem.last_attn_weights contains the
+    attention distribution over K_mem slots. We push this attention toward
+    slots that contain passage content (not filler).
+
+    This avoids the collapse problem of cosine similarity loss — the target
+    is a distribution over discrete slots, not a continuous direction.
+
+    Args:
+        mem: HopfieldMemory module with last_attn_weights set
+        passage_slot_indices: list of int, which K_mem slots hold passage content
+        device: torch device
+
+    Returns:
+        Scalar loss (KL divergence from target attention distribution).
+    """
+    if mem.last_attn_weights is None or not passage_slot_indices:
+        return torch.tensor(0.0, device=device)
+
+    # attn_weights: (batch, qa_tokens, n_slots) from QA chunk retrieval
+    attn_weights = mem.last_attn_weights  # already has gradients from forward
+
+    n_slots = attn_weights.shape[-1]
+
+    # Build target: uniform over passage slots, zero on everything else
+    target = torch.zeros(n_slots, device=device)
+    for idx in passage_slot_indices:
+        if idx < n_slots:
+            target[idx] = 1.0
+
+    if target.sum() < 1e-8:
+        return torch.tensor(0.0, device=device)
+
+    target = target / target.sum()  # normalize to distribution
+
+    # Average attention across batch and qa tokens → (n_slots,)
+    # Then compute KL(target || attn) to push attn toward passage slots
+    mean_attn = attn_weights.mean(dim=(0, 1))  # (n_slots,)
+
+    # Cross-entropy loss: -sum(target * log(attn + eps))
+    # This is simpler and more stable than KL divergence
+    loss = -(target * torch.log(mean_attn + 1e-8)).sum()
+
+    return loss
+
+
 def train_and_eval(
     model, train_dataset, eval_dataset, device,
     num_epochs=10, lr_memory=1e-3, lr_lora=2e-4,
     log_every=50, two_phase=False, output_dir="results",
+    retrieval_loss_weight=0.0,
 ):
     """Train with answer-only loss on QA chunks."""
     memory_params = get_memory_params(model)
@@ -372,11 +429,13 @@ def train_and_eval(
     phase_1_end = num_epochs // 2 if two_phase else 0
     phase_1_done = False
 
-    print(f"\nTraining: {total_steps} steps, {num_epochs} epochs")
+    print(f"\nTraining: {total_steps} steps, {num_epochs} epochs"
+          f"{f', retrieval_weight={retrieval_loss_weight}' if retrieval_loss_weight > 0 else ''}")
     model.train()
     global_step = 0
     train_losses = []
     answer_losses = []
+    ret_losses = []
     start_time = time.time()
 
     for epoch in range(num_epochs):
@@ -425,11 +484,16 @@ def train_and_eval(
             doc = train_dataset.documents[doc_idx]
             chunks = doc["chunks"]
             n_chunks = len(chunks)
+            n_passage = doc["n_passage_chunks"]
             answer_mask = doc["answer_mask"].to(device)
 
             # Reset memory and enable gradient persistence
             reset_memories(model)
             set_persistent_grad(model, True)
+
+            # For attention supervision: track which K_mem slots hold passage content
+            mem = _get_memory_module(model)
+            passage_slot_indices = []  # which write_ptr slots got passage data
 
             # Process each chunk independently
             doc_loss = torch.tensor(0.0, device=device)
@@ -439,6 +503,12 @@ def train_and_eval(
             for chunk_idx, chunk in enumerate(chunks):
                 chunk_ids = chunk.unsqueeze(0).to(device)  # (1, chunk_size)
                 is_qa_chunk = (chunk_idx == n_chunks - 1)
+                is_passage = chunk_idx < n_passage
+
+                # Track write_ptr before forward to know which slot this chunk writes to
+                if retrieval_loss_weight > 0 and mem is not None and is_passage:
+                    slot_idx = (mem.write_ptr % mem.n_slots).item()
+                    passage_slot_indices.append(slot_idx)
 
                 output = model(chunk_ids)
 
@@ -466,6 +536,14 @@ def train_and_eval(
             # Average loss
             doc_loss = doc_loss / max(n_loss_chunks, 1)
 
+            # Add attention supervision loss
+            ret_loss = torch.tensor(0.0, device=device)
+            if retrieval_loss_weight > 0 and mem is not None:
+                ret_loss = _compute_attention_supervision_loss(
+                    mem, passage_slot_indices, device
+                )
+                doc_loss = doc_loss + retrieval_loss_weight * ret_loss
+
             optimizer.zero_grad()
             doc_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -480,21 +558,27 @@ def train_and_eval(
 
             train_losses.append(doc_loss.item())
             answer_losses.append(qa_loss.item())
+            ret_losses.append(ret_loss.item() if isinstance(ret_loss, torch.Tensor) else ret_loss)
             global_step += 1
 
             if global_step % log_every == 0:
                 avg_loss = sum(train_losses[-log_every:]) / log_every
                 avg_qa = sum(answer_losses[-log_every:]) / log_every
+                avg_ret = sum(ret_losses[-log_every:]) / log_every
                 elapsed = time.time() - start_time
+                ret_info = f", ret_loss={avg_ret:.4f}" if retrieval_loss_weight > 0 else ""
                 print(f"  step {global_step}/{total_steps}, "
-                      f"loss={avg_loss:.4f}, qa_loss={avg_qa:.4f}, "
+                      f"loss={avg_loss:.4f}, qa_loss={avg_qa:.4f}{ret_info}, "
                       f"lr={scheduler.get_last_lr()[0]:.2e}, {elapsed:.0f}s")
 
         # Evaluate at end of each epoch
         print(f"\n  === Epoch {epoch + 1}/{num_epochs} eval ===")
         eval_results = evaluate(model, eval_dataset, device, verbose=False)
+        attn_info = ""
+        if eval_results.get("attn_on_passage") is not None:
+            attn_info = f", attn_passage={eval_results['attn_on_passage']:.1%}"
         print(f"  Token accuracy: {eval_results['token_accuracy']:.1%}, "
-              f"Exact match: {eval_results['exact_match']:.1%}")
+              f"Exact match: {eval_results['exact_match']:.1%}{attn_info}")
         model.train()
 
     return evaluate(model, eval_dataset, device, verbose=True)
@@ -515,8 +599,8 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
     exact_match_pairs = 0
     debug_count = 0
 
-    # Gate analysis
-    gate_by_type = {"passage": [], "filler": [], "qa": []}
+    # Attention analysis: how much attention lands on passage slots
+    attn_on_passage_list = []
 
     with torch.no_grad():
         for doc_idx, doc in enumerate(dataset.documents):
@@ -528,23 +612,28 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
 
             reset_memories(model)
 
-            # Capture gate values
-            mem_modules = [m for m in model.modules() if isinstance(m, HopfieldMemory)]
+            mem = _get_memory_module(model)
+            passage_slot_indices = []
 
             for chunk_idx, chunk in enumerate(chunks):
                 chunk_ids = chunk.unsqueeze(0).to(device)
-                output = model(chunk_ids)
+                is_passage = chunk_idx < n_passage
 
-                # Classify chunk type for gate analysis
-                if mem_modules and mem_modules[0].write_mode == "gate":
-                    mem = mem_modules[0]
-                    x_cast = chunk_ids.float()  # rough gate check
-                    # Get hidden states from a quick forward
-                    # (already done above, just record the gate value from memory state)
+                # Track passage slots
+                if mem is not None and is_passage:
+                    slot_idx = (mem.write_ptr % mem.n_slots).item()
+                    passage_slot_indices.append(slot_idx)
+
+                output = model(chunk_ids)
 
                 is_qa_chunk = (chunk_idx == n_chunks - 1)
 
                 if is_qa_chunk:
+                    # Measure attention on passage slots
+                    if mem is not None and mem.last_attn_weights is not None and passage_slot_indices:
+                        attn = mem.last_attn_weights.mean(dim=(0, 1))  # (n_slots,)
+                        passage_attn = sum(attn[s].item() for s in passage_slot_indices if s < len(attn))
+                        attn_on_passage_list.append(passage_attn)
                     # Check answer tokens
                     logits = output.logits[0]  # (chunk_size, vocab_size)
                     predictions = logits[:-1].argmax(dim=-1)  # (chunk_size - 1,)
@@ -591,12 +680,16 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
 
     token_accuracy = correct_answer_tokens / max(total_answer_tokens, 1)
     exact_match = exact_match_pairs / max(total_pairs, 1)
+    attn_on_passage = (sum(attn_on_passage_list) / len(attn_on_passage_list)
+                       if attn_on_passage_list else None)
 
     if verbose:
         print(f"\n  Token accuracy: {correct_answer_tokens}/{total_answer_tokens} "
               f"= {token_accuracy:.1%}")
         print(f"  Exact match: {exact_match_pairs}/{total_pairs} "
               f"= {exact_match:.1%}")
+        if attn_on_passage is not None:
+            print(f"  Attention on passage slots: {attn_on_passage:.1%}")
 
     # Gate analysis
     gate_analysis = _analyze_gate_values(model, dataset, device)
@@ -616,6 +709,7 @@ def evaluate(model, dataset, device, verbose=True, n_debug=10):
         "exact_match_pairs": exact_match_pairs,
         "total_pairs": total_pairs,
         "gate_analysis": gate_analysis,
+        "attn_on_passage": attn_on_passage,
     }
 
 
@@ -719,6 +813,8 @@ def main():
     parser.add_argument("--lr-memory", type=float, default=1e-3)
     parser.add_argument("--lr-lora", type=float, default=2e-4)
     parser.add_argument("--two-phase", action="store_true")
+    parser.add_argument("--retrieval-loss-weight", type=float, default=0.0,
+                        help="Weight for auxiliary retrieval alignment loss")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -781,6 +877,7 @@ def main():
         log_every=args.log_every,
         two_phase=args.two_phase,
         output_dir=args.output_dir,
+        retrieval_loss_weight=args.retrieval_loss_weight,
     )
 
     results["config"] = vars(args)

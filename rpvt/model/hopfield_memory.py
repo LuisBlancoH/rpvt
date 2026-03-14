@@ -79,6 +79,7 @@ class HopfieldMemory(nn.Module):
 
         self._nan_debug = False
         self.persistent_grad = False  # if True, don't detach state between calls
+        self.last_attn_weights = None  # stored after each forward for supervision
 
     def reset_memory(self):
         self.K_mem.zero_()
@@ -134,6 +135,7 @@ class HopfieldMemory(nn.Module):
             if mem_strength.sum() < 1e-8:
                 # Empty memory → zero output
                 r_chunk = torch.zeros_like(q_chunk)
+                self.last_attn_weights = None
             else:
                 # Mask out empty slots
                 slot_mask = (mem_strength > 1e-8).to(dtype=param_dtype)  # (n_slots,)
@@ -141,6 +143,7 @@ class HopfieldMemory(nn.Module):
                 attn_scores = attn_scores + (1 - slot_mask).unsqueeze(0).unsqueeze(0) * (-1e9)
                 attn_weights = F.softmax(attn_scores, dim=-1)  # (batch, c_len, n_slots)
                 r_chunk = torch.matmul(attn_weights, V_mem)  # (batch, c_len, memory_size)
+                self.last_attn_weights = attn_weights  # (batch, c_len, n_slots)
 
             retrieved_chunks.append(r_chunk)
 
