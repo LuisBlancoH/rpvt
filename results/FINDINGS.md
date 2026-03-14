@@ -361,6 +361,35 @@ Replaced cosine retrieval loss with attention supervision: cross-entropy loss pu
 3. May need to bypass W_value projection and store raw hidden states
 4. The W_out projection (256→2048, initialized to zero) may be too constrained
 
+### Key Discovery 21: Memory Contributes Zero — Frozen Model Can't Use W_out Injection
+
+Definitive controlled experiment: trained LoRA for 5 epochs **without memory** and got the same accuracy as all memory configurations. The entire ~15% accuracy comes from LoRA learning from passage/filler LM loss. Memory adds nothing.
+
+| Config | Token Acc (ep3) | Memory contribution |
+|---|---|---|
+| Untrained baseline | 10.2% | — |
+| **No memory, trained LoRA** | **15.5%** | **N/A** |
+| Memory, mean-pool (256-dim) | 14.9% | 0% |
+| Memory, mean-pool (1024-dim) | 15.0% | 0% |
+| Memory, mean-pool (2048-dim) | 14.9% | 0% |
+| Memory, n_extract=4 | 14.8% | 0% |
+
+Furthermore, 100% vs 3% attention on passage slots makes no difference — the W_out output is noise either way.
+
+**Root cause**: The frozen model's layers 19-35 have never seen memory signals in their residual stream. W_out (initialized to zero, trained) adds a signal, but downstream layers treat it as noise. LoRA rank 16 on q_proj/v_proj is insufficient to learn to interpret memory injections.
+
+**Implications for architecture**:
+1. Additive residual injection into a frozen pretrained model doesn't work
+2. Need LoRA specifically at/after the memory injection layer to help the model use memory
+3. Or need a different injection mechanism (cross-attention, gated addition, output-space injection)
+4. Or need to train from scratch / full fine-tune (not practical at 3B scale)
+
+### Key Discovery 22: Learned Extraction Queries (n_extract=4)
+
+Replaced mean-pooling with k=4 learned queries that cross-attend over chunk tokens to produce diverse summary vectors. Each query could specialize in different info types (entities, numbers, etc.).
+
+Result: same accuracy as mean-pooling. But this was moot since Discovery 21 shows the injection path itself is broken. The extraction mechanism should be revisited once injection works.
+
 ### Open Questions
 
 1. ~~Does recall-weighted loss enable retrieval?~~ **Yes, for 1 pair (v2.6).**
@@ -368,12 +397,14 @@ Replaced cosine retrieval loss with attention supervision: cross-entropy loss pu
 3. ~~Can three-phase improve on two-phase?~~ **No — pretrained transformer hurts M learning.**
 4. ~~Does per-chunk processing make memory necessary?~~ **Yes — LoRA alone at chance.**
 5. ~~Can shared Q=K init solve alignment?~~ **No — gates collapse.**
-6. ~~Does answer-only loss on NL QA produce memory-dependent retrieval?~~ **Marginal — +4% over baseline.**
+6. ~~Does answer-only loss on NL QA produce memory-dependent retrieval?~~ **No — all improvement is LoRA.**
 7. ~~Does the gate learn passage vs filler discrimination on natural text?~~ **Yes — 2.6x ratio.**
 8. ~~Is attention alignment the bottleneck?~~ **No — 100% attention on passage slots already.**
-9. Can per-token storage (no chunk aggregation) retain enough factual info?
-10. Does storing raw hidden states (bypassing W_value) help?
-11. Does larger memory_size (1024+) improve value encoding?
+9. ~~Does larger memory_size help?~~ **No — 256/1024/2048 all identical.**
+10. ~~Does learned extraction (multi-slot) help?~~ **No — injection path itself is broken.**
+11. Can LoRA at the memory layer help the model use memory output?
+12. Does cross-attention injection (instead of additive) work better?
+13. Does injecting at the output/logits level bypass the frozen-model problem?
 
 ---
 *Last updated: 2026-03-14*

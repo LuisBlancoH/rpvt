@@ -37,17 +37,16 @@ Research project building **architectural-level memory for LLM agents**. Not sca
 
 ## What Doesn't Work (The Core Bottleneck)
 
-**Value encoding/utilization is the unsolved problem.** The memory correctly identifies what to store (gate) and correctly retrieves the right slots (attention), but the retrieved values don't help predict answers.
+**The memory module adds zero value.** Controlled experiment: training LoRA without memory gives 15.5% — identical to all memory configs (~14.8%). The +5% over untrained baseline (10.2%) is entirely from LoRA learning on passage/filler LM loss. Memory output is ignored.
 
-- memory_size=256: 14.2% (vs 10.2% baseline)
-- memory_size=1024: 15.6%
-- memory_size=2048: 14.3%
-- Increasing value dimensionality doesn't help
+**Root cause**: Additive W_out injection into the residual stream of a frozen model doesn't work. Layers 19-35 were never trained to interpret memory signals. LoRA rank 16 on q_proj/v_proj is insufficient to adapt.
 
-**Hypotheses for why**:
-1. Chunk aggregation: averaging 128 tokens into one vector destroys token-level facts
-2. W_out injection: frozen model can't use the memory signal in the residual stream
-3. Both
+| Config | Token Acc | Memory adds |
+|---|---|---|
+| No memory, trained LoRA | 15.5% | N/A |
+| Memory (any size/config) | ~14.8% | 0% |
+
+What DOES work: gate discrimination (2.6x passage/filler), attention alignment (100% on passage slots). The read/write pipeline is functional — the injection point is broken.
 
 ## Experiment History Summary
 
@@ -56,17 +55,18 @@ Research project building **architectural-level memory for LLM agents**. Not sca
 - **v3.2**: Pivoted to NLP recall (SQuAD + synthetic facts). Discovered:
   - SQuAD contaminated by parametric knowledge (55.5% baseline)
   - Synthetic facts with truly unique entities work (10.2% baseline)
-  - Gate learns, attention aligns, but values don't help
-  - Attention supervision proves alignment was never the bottleneck
-  - Value capacity (memory_size) is not the bottleneck either
+  - Gate works (2.6x), attention works (100%), but memory output ignored
+  - memory_size doesn't matter (256=1024=2048)
+  - Learned extraction queries (n_extract=4) don't matter
+  - **Critical**: no-memory trained LoRA matches memory configs → W_out injection is broken
 
-## Next Steps to Try
+## Next Steps to Try (Injection Problem)
 
-1. **Per-token storage**: Write each token to its own slot (no chunk aggregation). Tests whether aggregation is the problem.
-2. **Multi-slot learned selection**: k slots per chunk with learned routing of which tokens to store.
-3. **Larger W_out / multi-layer W_out**: More expressive value-to-residual projection.
-4. **LoRA at memory layer**: Let the layer receiving memory output adapt to use it.
-5. **Cross-attention readout**: Instead of additive injection, use cross-attention to read from memory.
+1. **LoRA at memory injection layer**: Add LoRA to layers 18-20 so the model can learn to use memory signals
+2. **Cross-attention injection**: Replace additive W_out with a cross-attention layer that queries memory
+3. **Output-space injection**: Inject at logits level instead of hidden state level
+4. **Gated injection**: `output = x + gate * W_out(retrieved)` where gate is learned per-token
+5. **Train from scratch on smaller model**: Eliminates the frozen-model problem entirely
 
 ## Environment
 
