@@ -32,16 +32,25 @@ class MemoryBank(nn.Module):
         n_slots: int = 64,
         gate_bias: float = -2.0,
         decay: float = 0.999,
+        n_extract: int = 1,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.n_slots = n_slots
         self.decay = decay
+        self.n_extract = n_extract
 
         # Write gate
         self.W_gate = nn.Linear(hidden_size, 1, bias=True)
         nn.init.zeros_(self.W_gate.weight)
         nn.init.constant_(self.W_gate.bias, gate_bias)
+
+        # Learned extraction queries: k queries that cross-attend over chunk tokens
+        # to produce k diverse hidden state vectors instead of mean-pooling
+        if n_extract > 1:
+            self.extract_queries = nn.Parameter(
+                torch.randn(n_extract, hidden_size) * 0.02
+            )
 
         # Storage for raw hidden states
         self.register_buffer("mem_states", torch.zeros(n_slots, hidden_size))
@@ -66,10 +75,6 @@ class MemoryBank(nn.Module):
 
         gate = torch.sigmoid(self.W_gate(x))  # (batch, seq_len, 1)
         weights = gate.squeeze(-1)  # (batch, seq_len)
-
-        # Gate-weighted aggregation into one slot per call
-        w_sum = weights.sum(dim=(0, 1)).clamp(min=1e-8)
-        aggregated = (x * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum  # (hidden_size,)
         write_str = weights.mean().item()
 
         # Working copies for autograd compatibility
@@ -81,13 +86,44 @@ class MemoryBank(nn.Module):
         seq_len = hidden_states.shape[1]
         mem_strength = mem_strength * (self.decay ** seq_len)
 
-        # Write to circular buffer
-        slot_idx = write_ptr % self.n_slots
-        mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
-        mask_2d = mask.unsqueeze(1)
-        mem_states = mem_states * (1 - mask_2d) + mask_2d * aggregated.unsqueeze(0)
-        mem_strength = mem_strength * (1 - mask) + mask * write_str
-        write_ptr = write_ptr + 1
+        if self.n_extract > 1:
+            # Learned extraction: k queries cross-attend over chunk tokens
+            # to produce k diverse hidden state vectors
+            eq = self.extract_queries.to(dtype=param_dtype)  # (k, hidden_size)
+            extract_scores = torch.matmul(
+                eq.unsqueeze(0), x.transpose(-1, -2)
+            ) / (self.hidden_size ** 0.5)  # (batch, k, seq_len)
+
+            # Apply gate as mask on extraction attention
+            gate_mask = weights.unsqueeze(1)  # (batch, 1, seq_len)
+            extract_scores = extract_scores + torch.log(gate_mask.clamp(min=1e-8))
+
+            extract_weights = F.softmax(extract_scores, dim=-1)  # (batch, k, seq_len)
+
+            # Extract k summary vectors in hidden space
+            extracted = torch.matmul(extract_weights, x)  # (batch, k, hidden_size)
+            # Mean across batch
+            extracted = extracted.mean(dim=0)  # (k, hidden_size)
+
+            # Write k slots
+            for ei in range(self.n_extract):
+                slot_idx = write_ptr % self.n_slots
+                mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
+                mask_2d = mask.unsqueeze(1)
+                mem_states = mem_states * (1 - mask_2d) + mask_2d * extracted[ei].unsqueeze(0)
+                mem_strength = mem_strength * (1 - mask) + mask * write_str
+                write_ptr = write_ptr + 1
+        else:
+            # Single aggregated write (gate-weighted mean-pool)
+            w_sum = weights.sum(dim=(0, 1)).clamp(min=1e-8)
+            aggregated = (x * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum  # (hidden_size,)
+
+            slot_idx = write_ptr % self.n_slots
+            mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
+            mask_2d = mask.unsqueeze(1)
+            mem_states = mem_states * (1 - mask_2d) + mask_2d * aggregated.unsqueeze(0)
+            mem_strength = mem_strength * (1 - mask) + mask * write_str
+            write_ptr = write_ptr + 1
 
         # Store
         if self.persistent_grad:

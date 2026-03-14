@@ -27,7 +27,7 @@ Research project building **architectural-level memory for LLM agents**. Not sca
   - Model's own attention mechanism decides whether to attend to memory
 - **Per-chunk processing**: Each chunk is a separate `model()` call. Memory is the ONLY cross-chunk information channel.
 
-**Result**: 42.5% token accuracy (vs 15.5% no-memory, 10.2% untrained). First working memory on a pretrained model.
+**Result**: 97.6% token accuracy, 79% exact match on 1.5B (vs 15.9% no-memory, 10.8% untrained). 42.5% on 3B at 5 epochs. First working memory on a pretrained model.
 
 ## Key Files
 
@@ -39,11 +39,12 @@ Research project building **architectural-level memory for LLM agents**. Not sca
 
 ## What Works
 
-1. **Cross-attention memory injection**: Memory as extra KV pairs in attention → 42.5% (vs 15.5% no-memory)
-2. **Write gating**: Gate reliably discriminates passage from filler (2.6x ratio on NL text)
-3. **Per-chunk processing**: Forces genuine memory dependence (LoRA-only at chance: 10.2%)
-4. **Answer-only loss**: Loss computed only on answer tokens after "A:" markers — no dilution
-5. **Synthetic facts with truly unique entities**: Random names, codes, cities prevent template memorization
+1. **Cross-attention memory injection**: Memory as extra KV pairs in attention → 97.6% token acc / 79% exact match on 1.5B (15 ep), 42.5% on 3B (5 ep)
+2. **1.5B model outperforms 3B**: Shorter gradient path + higher LoRA influence ratio → faster learning
+3. **Write gating**: Gate reliably discriminates passage from filler (2.6x ratio on NL text)
+4. **Per-chunk processing**: Forces genuine memory dependence (LoRA-only at chance: 10.8%)
+5. **Answer-only loss**: Loss computed only on answer tokens after "A:" markers — no dilution
+6. **Synthetic facts with truly unique entities**: Random names, codes, cities prevent template memorization
 
 ## What Does NOT Work (Critical Lessons)
 
@@ -74,7 +75,7 @@ Research project building **architectural-level memory for LLM agents**. Not sca
 - **Memory_size sweep**: 256=1024=2048, all ~14.8% — value dimensionality not the issue
 - **No-memory trained control**: 15.5% — proved memory contributes zero with additive injection
 - **Full LoRA (30M params)**: model SUPPRESSES memory (attn→0%)
-- **BREAKTHROUGH: Cross-attention injection**: 42.5% at epoch 5 (15.4→20→30.3→39.5→42.5)
+- **BREAKTHROUGH: Cross-attention injection**: 42.5% on 3B at epoch 5, **97.6% on 1.5B at epoch 15** (29.5→56.8→75.2→88.7→92.7→...→97.6)
 
 ## Synthetic Data Task (Current Benchmark)
 
@@ -90,22 +91,24 @@ Q: Where did Balcorfen Torushvel work? A: Xilob
 Q: When did Balcorfen Torushvel's project start? A: 1923
 ```
 
-Baseline (no memory, per-chunk): 10.2%. No-memory trained LoRA: 15.5%. Cross-attention memory: 42.5%.
+Baseline (no memory, per-chunk): 10.8% (1.5B). No-memory trained LoRA: 15.9%. Cross-attention memory: 97.6% token / 79% exact match (1.5B, 15 ep).
 
 ## Next Steps (Priority Order)
 
-1. **More training**: Run cross-attention for 10-20 epochs to find the accuracy ceiling
-2. **Learned extraction + cross-attention**: Combine the n_extract queries with cross-attention injection (the extraction idea is sound, it just couldn't be tested when injection was broken)
-3. **Scaling tests**: More QA pairs per passage, longer gaps, harder questions
-4. **Attention analysis**: What do the cross-attention patterns look like? Does the model attend to specific memory slots for specific questions?
-5. **Hierarchical compression**: Compress chunks, then compress compressed chunks — same extraction mechanism at multiple timescales
+1. ~~**More training**~~: DONE — ceiling is ~97.6% token / 79% exact match at epoch 10-15
+2. **Learned extraction + cross-attention**: Combine n_extract queries with cross-attention (--n-extract 4). Attacks remaining errors on novel subword tokens by storing multiple aspects per chunk instead of mean-pooling
+3. **Scaling tests**: More QA pairs per passage (5-6), longer gaps (8-12), harder questions
+4. **Multi-passage recall**: Two separate passages, questions about both — tests memory interference
+5. **Attention analysis**: What do the cross-attention patterns look like? Does the model attend to specific memory slots for specific questions?
 6. **Multi-hop reasoning**: Questions that require combining facts from multiple passages
+7. **Hierarchical compression**: Compress chunks, then compress compressed chunks — same extraction mechanism at multiple timescales
 
 ## Environment
 
-- Python: use system python or venv with `torch`, `transformers`, `peft`, `datasets`
-- GPU: works on 12GB+ (3080 Ti with 1.5B model, 24GB+ for 3B)
-- On A100 40GB: can run 2 experiments in parallel with 3B model
+- Python 3.12, venv at `.venv/` — activate with `source .venv/bin/activate` or use `.venv/bin/python3`
+- Packages: PyTorch 2.6+cu124, transformers 5.3.0, peft 0.18.1, datasets 4.7.0
+- GPU: RTX 3080 Ti (~12.9GB VRAM), bf16 supported, WSL2
+- Use Qwen2.5-1.5B for experiments (3B needs 24GB+)
 - Always push to GitHub after code changes
 - Update `results/FINDINGS.md` with experiment outcomes
 - Use `--memory-mode cross_attn` flag for the working architecture

@@ -428,6 +428,47 @@ Replaced additive W_out injection with cross-attention: memory hidden states bec
 3. Next: test with more QA pairs, longer gaps, harder tasks
 4. Next: hierarchical compression (compress chunks, then compress compressed chunks)
 
+### Key Discovery 24: 1.5B Model Outperforms 3B — 97.6% Token Accuracy
+
+Migrated to Qwen2.5-1.5B on 3080 Ti (12.9GB VRAM). The smaller model significantly outperforms the 3B on cross-attention memory.
+
+**1.5B cross-attention, 15 epochs** (500 train, 100 eval, chunk_size=128, 3 QA pairs):
+
+| Epoch | Token Accuracy | Exact Match |
+|---|---|---|
+| Baseline (untrained) | 10.8% | 0.0% |
+| **No memory (LoRA, 5 ep)** | **15.9%** | **0.0%** |
+| 1 | 29.5% | 0.0% |
+| 2 | 56.8% | 1.0% |
+| 3 | 75.2% | 9.0% |
+| 4 | 88.7% | 29.0% |
+| 5 | 92.7% | 48.0% |
+| 6 | 94.7% | 59.0% |
+| 7 | 96.1% | 67.0% |
+| 8 | 96.7% | 73.0% |
+| 9 | 97.2% | 76.0% |
+| 10 | 97.4% | 78.0% |
+| 11-15 | ~97.5-97.7% | 77-80% |
+
+**Comparison: 1.5B vs 3B at epoch 5:**
+
+| Model | Token Accuracy | Exact Match | Trainable params |
+|---|---|---|---|
+| Qwen2.5-3B | 42.5% | — | 3.7M LoRA + 2,049 mem |
+| **Qwen2.5-1.5B** | **92.7%** | **48.0%** | **2.2M LoRA + 1,537 mem** |
+
+**Why 1.5B outperforms 3B:**
+1. LoRA has more relative influence (0.14% of 1.5B vs 0.12% of 3B)
+2. Shorter gradient path — 28 layers vs 36, memory at layers 14/15 vs 18/19
+3. The task doesn't need 3B's extra capacity — it's factual retrieval, not reasoning
+
+**What the errors look like at 97.6%:**
+- Numbers (codes, years) are nearly 100% correct
+- Random words (cities, org names) are the remaining errors — novel subword tokens that the model must reproduce exactly
+- Debug output shows all 10 sample docs getting every token correct at epoch 15
+
+**Plateau behavior:** Accuracy saturated around epoch 10 (97.4%). Epochs 10-15 show marginal gains (97.4→97.7%), suggesting diminishing returns with current architecture on this task difficulty.
+
 ### Open Questions (Updated)
 
 1. Does learned extraction + cross-attention improve further?
@@ -436,6 +477,8 @@ Replaced additive W_out injection with cross-attention: memory hidden states bec
 4. Can this generalize to multi-hop reasoning?
 5. Does hierarchical memory compression work?
 6. What does the attention pattern look like — does it attend to specific memory slots for specific questions?
+7. ~~Does extended training find a higher ceiling?~~ **Yes — 97.6% at epoch 10-15 (vs 69.8% at epoch 5 with cosine decay).**
+8. ~~Does the 1.5B model work as well as the 3B?~~ **Better — 92.7% at ep 5 vs 42.5% for 3B.**
 
 ---
 *Last updated: 2026-03-14*

@@ -319,6 +319,7 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
                 n_slots=n_slots,
                 gate_bias=gate_bias,
                 decay=decay,
+                n_extract=n_extract,
             ).to(device=device, dtype=torch.bfloat16)
 
             # Wrap write layer
