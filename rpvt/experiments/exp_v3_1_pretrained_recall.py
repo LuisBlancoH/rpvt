@@ -187,25 +187,34 @@ class MemoryWrapper(nn.Module):
 
 def reset_memories(model):
     """Reset memory in all wrapped layers."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     for module in model.modules():
         if isinstance(module, MemoryWrapper):
             module.reset_memory()
+        if isinstance(module, MemoryBank):
+            module.reset()
 
 
 def set_persistent_grad(model, enabled):
     """Enable/disable gradient persistence in memory modules."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     for module in model.modules():
         if isinstance(module, HopfieldMemory):
+            module.persistent_grad = enabled
+        if isinstance(module, MemoryBank):
             module.persistent_grad = enabled
 
 
 def detach_memory_state(model):
     """Detach memory state after backward pass to free computation graph."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     for module in model.modules():
         if isinstance(module, HopfieldMemory):
             module.K_mem = module.K_mem.detach()
             module.V_mem = module.V_mem.detach()
             module.mem_strength = module.mem_strength.detach()
+        if isinstance(module, MemoryBank):
+            module.detach_state()
 
 
 def make_chunk_local_mask(seq_len, chunk_size, device):
@@ -237,8 +246,14 @@ def make_chunk_local_mask(seq_len, chunk_size, device):
 
 def build_model(model_name, device, memory_layer, memory_size, n_slots,
                 decay, gate_bias, lora_rank, lora_targets, no_memory=False,
-                no_lora=False, init_qk_shared=False, n_extract=1):
-    """Load pretrained model, attach LoRA and Hopfield memory."""
+                no_lora=False, init_qk_shared=False, n_extract=1,
+                memory_mode="additive"):
+    """Load pretrained model, attach LoRA and Hopfield memory.
+
+    Args:
+        memory_mode: "additive" (W_out added to residual, original approach) or
+                     "cross_attn" (memory injected as extra KV pairs in next layer's attention)
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import get_peft_model, LoraConfig, TaskType
 
@@ -275,12 +290,10 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
     else:
         print("  No LoRA (memory only)")
 
-    # Attach Hopfield memory to target layer
+    # Attach memory to target layer
     if not no_memory:
         if memory_layer < 0:
             memory_layer = n_layers // 2  # default: middle layer
-        print(f"  Attaching Hopfield memory to layer {memory_layer}/{n_layers} "
-              f"(size={memory_size}, slots={n_slots}, decay={decay}, bias={gate_bias})")
 
         # Get the layers list — handle peft wrapping
         if hasattr(model, 'base_model'):
@@ -288,24 +301,70 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
         else:
             layers = model.model.layers
 
-        mem = HopfieldMemory(
-            hidden_size=hidden_size,
-            memory_size=memory_size,
-            n_slots=n_slots,
-            decay=decay,
-            write_mode="gate",
-            gate_bias=gate_bias,
-            w_out_std=0.0,
-            init_qk_shared=init_qk_shared,
-            n_extract=n_extract,
-        ).to(device=device, dtype=torch.bfloat16)
+        if memory_mode == "cross_attn":
+            from rpvt.model.cross_attention_memory import (
+                MemoryBank, WriteWrapper, MemoryAugmentedAttention,
+            )
 
-        original_layer = layers[memory_layer]
-        wrapped = MemoryWrapper(original_layer, mem)
-        layers[memory_layer] = wrapped
+            read_layer = memory_layer + 1
+            if read_layer >= n_layers:
+                read_layer = memory_layer  # fallback: same layer
 
-        n_mem = sum(p.numel() for p in mem.parameters())
-        print(f"  Memory params: {n_mem:,}")
+            print(f"  Cross-attention memory: write@layer {memory_layer}, "
+                  f"read@layer {read_layer} "
+                  f"(slots={n_slots}, decay={decay}, bias={gate_bias})")
+
+            bank = MemoryBank(
+                hidden_size=hidden_size,
+                n_slots=n_slots,
+                gate_bias=gate_bias,
+                decay=decay,
+            ).to(device=device, dtype=torch.bfloat16)
+
+            # Wrap write layer
+            write_wrapped = WriteWrapper(layers[memory_layer], bank)
+            layers[memory_layer] = write_wrapped
+
+            # Replace read layer's self_attn with memory-augmented version
+            read_layer_module = layers[read_layer]
+            # Handle peft wrapping — need to get the actual layer
+            if hasattr(read_layer_module, 'self_attn'):
+                original_attn = read_layer_module.self_attn
+            elif hasattr(read_layer_module, 'layer') and hasattr(read_layer_module.layer, 'self_attn'):
+                original_attn = read_layer_module.layer.self_attn
+                read_layer_module = read_layer_module.layer
+            else:
+                raise ValueError(f"Can't find self_attn in layer {read_layer}")
+
+            aug_attn = MemoryAugmentedAttention(original_attn, bank)
+            read_layer_module.self_attn = aug_attn
+
+            n_mem = sum(p.numel() for p in bank.parameters())
+            print(f"  Memory params: {n_mem:,}")
+
+        else:
+            # Original additive mode
+            print(f"  Attaching Hopfield memory to layer {memory_layer}/{n_layers} "
+                  f"(size={memory_size}, slots={n_slots}, decay={decay}, bias={gate_bias})")
+
+            mem = HopfieldMemory(
+                hidden_size=hidden_size,
+                memory_size=memory_size,
+                n_slots=n_slots,
+                decay=decay,
+                write_mode="gate",
+                gate_bias=gate_bias,
+                w_out_std=0.0,
+                init_qk_shared=init_qk_shared,
+                n_extract=n_extract,
+            ).to(device=device, dtype=torch.bfloat16)
+
+            original_layer = layers[memory_layer]
+            wrapped = MemoryWrapper(original_layer, mem)
+            layers[memory_layer] = wrapped
+
+            n_mem = sum(p.numel() for p in mem.parameters())
+            print(f"  Memory params: {n_mem:,}")
     else:
         print("  No memory (baseline)")
 

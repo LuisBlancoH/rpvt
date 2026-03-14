@@ -307,9 +307,12 @@ class SQuADRecallDataset(Dataset):
 
 
 def _get_memory_module(model):
-    """Get the HopfieldMemory module from the model."""
+    """Get the HopfieldMemory or MemoryBank module from the model."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     for module in model.modules():
         if isinstance(module, HopfieldMemory):
+            return module
+        if isinstance(module, MemoryBank):
             return module
     return None
 
@@ -800,6 +803,9 @@ def main():
     # Ablations
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument("--no-lora", action="store_true")
+    parser.add_argument("--memory-mode", type=str, default="additive",
+                        choices=["additive", "cross_attn"],
+                        help="Memory injection: 'additive' (residual) or 'cross_attn' (KV pairs in attention)")
 
     # Task
     parser.add_argument("--data-source", type=str, default="synthetic",
@@ -847,6 +853,7 @@ def main():
         no_lora=args.no_lora,
         init_qk_shared=args.init_qk_shared,
         n_extract=args.n_extract,
+        memory_mode=args.memory_mode,
     )
 
     # Create datasets
