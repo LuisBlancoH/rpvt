@@ -112,19 +112,87 @@ def _generate_synthetic_facts(rng, n_docs, max_qa_pairs):
     return docs
 
 
+def _generate_single_person_facts(rng):
+    """Generate a single person's passage and QA pairs."""
+    name = _random_name(rng)
+    first = name.split()[0]
+    city = _random_word(rng, 5, 9).capitalize()
+    org = f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+    field = f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+    code_a = rng.randint(100, 999)
+    code_b = rng.randint(100, 999)
+    year = rng.randint(1800, 2020)
+
+    passage = (
+        f"{name} was a researcher at {org} in {city}. "
+        f"Their work on {field} produced result code {code_a}. "
+        f"The project started in {year} and generated output code {code_b}. "
+        f"{first} specialized in {field} at the {city} campus."
+    )
+
+    all_qas = [
+        {"question": f"Where did {name} work?", "answer": city},
+        {"question": f"What organization was {name} part of?", "answer": org},
+        {"question": f"What was {name}'s result code?", "answer": str(code_a)},
+        {"question": f"When did {name}'s project start?", "answer": str(year)},
+        {"question": f"What was {name}'s output code?", "answer": str(code_b)},
+        {"question": f"What field did {name} work in?", "answer": field},
+    ]
+    return passage, all_qas
+
+
+def _generate_multi_passage_facts(rng, n_docs, max_qa_pairs_per_passage=3):
+    """Generate documents with TWO passages about different people.
+
+    Each document has two passages (A and B), each about a different person.
+    QA pairs are interleaved from both passages, testing whether memory can
+    keep facts from different passages separate.
+
+    Returns list of tuples: (passage_a, passage_b, combined_qas)
+    """
+    docs = []
+    for _ in range(n_docs):
+        passage_a, qas_a = _generate_single_person_facts(rng)
+        passage_b, qas_b = _generate_single_person_facts(rng)
+
+        # Select QA pairs from each passage
+        selected_a = rng.sample(qas_a, min(max_qa_pairs_per_passage, len(qas_a)))
+        selected_b = rng.sample(qas_b, min(max_qa_pairs_per_passage, len(qas_b)))
+
+        # Interleave QA pairs from both passages
+        combined_qas = []
+        for qa_a, qa_b in zip(selected_a, selected_b):
+            combined_qas.append(qa_a)
+            combined_qas.append(qa_b)
+        # Add any remaining if lengths differ
+        combined_qas.extend(selected_a[len(selected_b):])
+        combined_qas.extend(selected_b[len(selected_a):])
+
+        docs.append((passage_a, passage_b, combined_qas))
+    return docs
+
+
 class SQuADRecallDataset(Dataset):
     """Recall task with per-chunk processing.
 
-    Supports two data sources:
+    Supports three data sources:
     - "squad": SQuAD v2 passages (model may know answers from pretraining)
     - "synthetic": Generated passages with novel facts (answers require memory)
+    - "synthetic_multi": Two passages per doc, QA about both (tests interference)
 
-    Document structure:
+    Document structure (single passage):
       - 1+ passage chunks (context, tokenized)
       - gap_min..gap_max filler chunks (WikiText paragraphs)
       - 1 QA chunk: "Q: <question> A: <answer> Q: ... A: ..."
-        Loss is computed ONLY on answer tokens (after each "A:").
 
+    Document structure (multi-passage):
+      - 1+ passage A chunks
+      - gap_min..gap_max filler chunks
+      - 1+ passage B chunks
+      - gap_min..gap_max filler chunks
+      - 1 QA chunk with interleaved questions about both passages
+
+    Loss is computed ONLY on answer tokens (after each "A:").
     The passage is only accessible via memory — per-chunk processing prevents
     cross-chunk attention. Every answer token requires memory.
     """
@@ -178,6 +246,14 @@ class SQuADRecallDataset(Dataset):
             generated = _generate_synthetic_facts(rng, n_docs, max_qa_pairs)
             passage_qas = generated
 
+        elif data_source == "synthetic_multi":
+            print(f"  Generating {n_docs} multi-passage documents...")
+            multi_docs = _generate_multi_passage_facts(
+                rng, n_docs, max_qa_pairs_per_passage=max_qa_pairs
+            )
+            # Will be handled separately below
+            passage_qas = None
+
         else:
             raise ValueError(f"Unknown data_source: {data_source}")
 
@@ -189,68 +265,136 @@ class SQuADRecallDataset(Dataset):
         print(f"  {len(filler_texts)} filler paragraphs available")
 
         self.documents = []
-        for doc_idx in range(len(passage_qas)):
-            ctx_text, selected_qas = passage_qas[doc_idx]
-            ctx_tokens = tokenizer.encode(ctx_text, add_special_tokens=False)
-            gap = rng.randint(gap_range[0], gap_range[1])
 
-            # Select QA pairs (may already be selected for synthetic)
-            if len(selected_qas) > max_qa_pairs:
-                selected_qas = rng.sample(selected_qas, max_qa_pairs)
+        if data_source == "synthetic_multi":
+            # Multi-passage: [PassageA] [filler] [PassageB] [filler] [QA about both]
+            for doc_idx in range(len(multi_docs)):
+                passage_a, passage_b, combined_qas = multi_docs[doc_idx]
+                gap_a = rng.randint(gap_range[0], gap_range[1])
+                gap_b = rng.randint(gap_range[0], gap_range[1])
 
-            # Build passage chunks
-            passage_chunks = []
-            for i in range(0, len(ctx_tokens), chunk_size):
-                chunk_tokens = ctx_tokens[i:i + chunk_size]
-                if len(chunk_tokens) < chunk_size:
-                    # Pad with eos token
-                    pad_id = tokenizer.eos_token_id or 0
-                    chunk_tokens = chunk_tokens + [pad_id] * (chunk_size - len(chunk_tokens))
-                passage_chunks.append(torch.tensor(chunk_tokens, dtype=torch.long))
+                def _make_chunks(text):
+                    tokens = tokenizer.encode(text, add_special_tokens=False)
+                    chunks = []
+                    for i in range(0, len(tokens), chunk_size):
+                        ct = tokens[i:i + chunk_size]
+                        if len(ct) < chunk_size:
+                            pad_id = tokenizer.eos_token_id or 0
+                            ct = ct + [pad_id] * (chunk_size - len(ct))
+                        chunks.append(torch.tensor(ct, dtype=torch.long))
+                    return chunks
 
-            # Build filler chunks
-            filler_chunks = []
-            for _ in range(gap):
-                filler_text = rng.choice(filler_texts)
-                filler_tokens = tokenizer.encode(filler_text, add_special_tokens=False)
-                if len(filler_tokens) >= chunk_size:
-                    start = rng.randint(0, len(filler_tokens) - chunk_size)
-                    chunk_tokens = filler_tokens[start:start + chunk_size]
+                def _make_filler(n):
+                    chunks = []
+                    for _ in range(n):
+                        ft = rng.choice(filler_texts)
+                        ft_tok = tokenizer.encode(ft, add_special_tokens=False)
+                        if len(ft_tok) >= chunk_size:
+                            start = rng.randint(0, len(ft_tok) - chunk_size)
+                            ct = ft_tok[start:start + chunk_size]
+                        else:
+                            pad_id = tokenizer.eos_token_id or 0
+                            ct = ft_tok + [pad_id] * (chunk_size - len(ft_tok))
+                        chunks.append(torch.tensor(ct, dtype=torch.long))
+                    return chunks
+
+                passage_a_chunks = _make_chunks(passage_a)
+                filler_a_chunks = _make_filler(gap_a)
+                passage_b_chunks = _make_chunks(passage_b)
+                filler_b_chunks = _make_filler(gap_b)
+
+                # Build QA chunk
+                qa_text = ""
+                for qa in combined_qas:
+                    qa_text += f" Q: {qa['question']} A: {qa['answer']}"
+                qa_text = qa_text.strip()
+
+                qa_tokens = tokenizer.encode(qa_text, add_special_tokens=False)
+                answer_mask = self._build_answer_mask(qa_text, combined_qas, tokenizer, chunk_size)
+
+                if len(qa_tokens) >= chunk_size:
+                    qa_tokens = qa_tokens[:chunk_size]
                 else:
                     pad_id = tokenizer.eos_token_id or 0
-                    chunk_tokens = filler_tokens + [pad_id] * (chunk_size - len(filler_tokens))
-                filler_chunks.append(torch.tensor(chunk_tokens, dtype=torch.long))
+                    qa_tokens = qa_tokens + [pad_id] * (chunk_size - len(qa_tokens))
+                qa_chunk = torch.tensor(qa_tokens, dtype=torch.long)
 
-            # Build QA chunk with answer masks
-            qa_text = ""
-            for qa in selected_qas:
-                qa_text += f" Q: {qa['question']} A: {qa['answer']}"
-            qa_text = qa_text.strip()
+                all_chunks = (passage_a_chunks + filler_a_chunks +
+                              passage_b_chunks + filler_b_chunks + [qa_chunk])
+                n_passage = len(passage_a_chunks) + len(passage_b_chunks)
 
-            qa_tokens = tokenizer.encode(qa_text, add_special_tokens=False)
+                self.documents.append({
+                    "chunks": all_chunks,
+                    "answer_mask": answer_mask,
+                    "qa_pairs": combined_qas,
+                    "gap": gap_a + gap_b,
+                    "n_passage_chunks": n_passage,
+                    "context": f"{passage_a}\n---\n{passage_b}",
+                })
+        else:
+            # Single-passage: [Passage] [filler] [QA]
+            for doc_idx in range(len(passage_qas)):
+                ctx_text, selected_qas = passage_qas[doc_idx]
+                ctx_tokens = tokenizer.encode(ctx_text, add_special_tokens=False)
+                gap = rng.randint(gap_range[0], gap_range[1])
 
-            # Find answer token positions by looking for "A:" markers
-            answer_mask = self._build_answer_mask(qa_text, selected_qas, tokenizer, chunk_size)
+                # Select QA pairs (may already be selected for synthetic)
+                if len(selected_qas) > max_qa_pairs:
+                    selected_qas = rng.sample(selected_qas, max_qa_pairs)
 
-            if len(qa_tokens) >= chunk_size:
-                qa_tokens = qa_tokens[:chunk_size]
-            else:
-                pad_id = tokenizer.eos_token_id or 0
-                qa_tokens = qa_tokens + [pad_id] * (chunk_size - len(qa_tokens))
+                # Build passage chunks
+                passage_chunks = []
+                for i in range(0, len(ctx_tokens), chunk_size):
+                    chunk_tokens = ctx_tokens[i:i + chunk_size]
+                    if len(chunk_tokens) < chunk_size:
+                        # Pad with eos token
+                        pad_id = tokenizer.eos_token_id or 0
+                        chunk_tokens = chunk_tokens + [pad_id] * (chunk_size - len(chunk_tokens))
+                    passage_chunks.append(torch.tensor(chunk_tokens, dtype=torch.long))
 
-            qa_chunk = torch.tensor(qa_tokens, dtype=torch.long)
+                # Build filler chunks
+                filler_chunks = []
+                for _ in range(gap):
+                    filler_text = rng.choice(filler_texts)
+                    filler_tokens = tokenizer.encode(filler_text, add_special_tokens=False)
+                    if len(filler_tokens) >= chunk_size:
+                        start = rng.randint(0, len(filler_tokens) - chunk_size)
+                        chunk_tokens = filler_tokens[start:start + chunk_size]
+                    else:
+                        pad_id = tokenizer.eos_token_id or 0
+                        chunk_tokens = filler_tokens + [pad_id] * (chunk_size - len(filler_tokens))
+                    filler_chunks.append(torch.tensor(chunk_tokens, dtype=torch.long))
 
-            # Combine all chunks
-            all_chunks = passage_chunks + filler_chunks + [qa_chunk]
+                # Build QA chunk with answer masks
+                qa_text = ""
+                for qa in selected_qas:
+                    qa_text += f" Q: {qa['question']} A: {qa['answer']}"
+                qa_text = qa_text.strip()
 
-            self.documents.append({
-                "chunks": all_chunks,
-                "answer_mask": answer_mask,  # (chunk_size,) binary mask for QA chunk
-                "qa_pairs": selected_qas,
-                "gap": gap,
-                "n_passage_chunks": len(passage_chunks),
-                "context": ctx_text,
-            })
+                qa_tokens = tokenizer.encode(qa_text, add_special_tokens=False)
+
+                # Find answer token positions by looking for "A:" markers
+                answer_mask = self._build_answer_mask(qa_text, selected_qas, tokenizer, chunk_size)
+
+                if len(qa_tokens) >= chunk_size:
+                    qa_tokens = qa_tokens[:chunk_size]
+                else:
+                    pad_id = tokenizer.eos_token_id or 0
+                    qa_tokens = qa_tokens + [pad_id] * (chunk_size - len(qa_tokens))
+
+                qa_chunk = torch.tensor(qa_tokens, dtype=torch.long)
+
+                # Combine all chunks
+                all_chunks = passage_chunks + filler_chunks + [qa_chunk]
+
+                self.documents.append({
+                    "chunks": all_chunks,
+                    "answer_mask": answer_mask,  # (chunk_size,) binary mask for QA chunk
+                    "qa_pairs": selected_qas,
+                    "gap": gap,
+                    "n_passage_chunks": len(passage_chunks),
+                    "context": ctx_text,
+                })
 
         # For compat with v3.1 training loop
         self.doc_sequences = self.documents
@@ -831,8 +975,8 @@ def main():
 
     # Task
     parser.add_argument("--data-source", type=str, default="synthetic",
-                        choices=["synthetic", "squad"],
-                        help="Data source: 'synthetic' (novel facts) or 'squad'")
+                        choices=["synthetic", "squad", "synthetic_multi"],
+                        help="Data source: 'synthetic' (single passage), 'synthetic_multi' (two passages), or 'squad'")
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--max-qa-pairs", type=int, default=3)
     parser.add_argument("--gap-min", type=int, default=2)
