@@ -498,8 +498,10 @@ Doubled the number of QA pairs per passage from 3 to 6. All 6 question types ask
 | 5 | 92.7% / 48% | 97.9% / 66% |
 | 6 | 94.7% / 59% | 98.7% / 77% |
 | 7 | 96.1% / 67% | 98.5% / 74% |
-| 10 | 97.4% / 78% | (running) |
-| 15 | 97.7% / 80% | (running) |
+| 8 | 96.7% / 73% | 99.0% / 81% |
+| 9 | 97.2% / 76% | **99.2% / 86%** |
+| 10 | 97.4% / 78% | 99.0% / 81% |
+| 15 | 97.7% / 80% | 99.2% / 86% |
 
 **Key findings:**
 1. **Token accuracy is HIGHER with 6 QA** — more answer tokens = richer gradient signal per doc
@@ -514,7 +516,7 @@ Doubled the number of QA pairs per passage from 3 to 6. All 6 question types ask
 | No memory baseline | 3 | — | 15.9% | 0% |
 | Cross-attn 15ep | 3 | 1 | 97.7% | 80% |
 | Cross-attn 15ep | 3 | 4 | 98.2% | 84% |
-| Cross-attn 15ep | 6 | 1 | 98.7%+ | 77%+ |
+| Cross-attn 15ep | 6 | 1 | 99.2% | 86% |
 
 ### Open Questions (Updated)
 
