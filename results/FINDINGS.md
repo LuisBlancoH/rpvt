@@ -509,26 +509,69 @@ Doubled the number of QA pairs per passage from 3 to 6. All 6 question types ask
 3. **Learning is faster** — 91.8% at epoch 3 (vs 75.2%) due to double the training signal
 4. **Memory capacity is not the bottleneck** — a single 1536-dim vector successfully encodes 6 distinct facts
 
+### Key Discovery 27: Long Gaps (6-12 filler chunks) — No Degradation
+
+Tested with 6-12 filler chunks between passage and QA (vs default 2-6). More filler means more writes to the circular buffer that could overwrite passage memories.
+
+**Result** (1.5B, 6 QA pairs, 15 epochs):
+
+| Gap range | Best Token Acc | Best Exact Match |
+|---|---|---|
+| 2-6 (default) | 99.2% | 86% |
+| **6-12 (long)** | **99.6%** | **92%** |
+
+**Actually better with longer gaps.** More chunks per doc = more forward passes = richer gradient signal. The gate successfully suppresses filler writes — passage memories are not corrupted despite up to 12 filler chunks.
+
+### Key Discovery 28: Multi-Passage Recall — 99.8% Token / 97% Exact Match
+
+Two passages about different people, with interleaved QA about both. Tests whether memory can keep facts from different passages separate (interference test).
+
+**Document structure**: [Passage A] [filler 2-6] [Passage B] [filler 2-6] [QA about both]
+
+**Result** (1.5B, 3 QA per person = 6 total, 15 epochs, n_extract=1):
+
+| Epoch | Token Accuracy | Exact Match |
+|---|---|---|
+| Baseline (no mem) | 12.2% | 0% |
+| 2 | 90.4% | 17% |
+| 5 | 99.2% | 86% |
+| 9 | 99.7% | 95% |
+| 12 | **99.8%** | **97%** |
+| 15 | 99.8% | 97% |
+
+**Best result across all experiments.** Only 3 token errors in 1881 tokens across 100 documents. The model perfectly distinguishes which facts belong to which person — no interference between passages in memory. Debug output shows all 10 sample docs completely correct, including novel subword tokens.
+
+**Why this matters:**
+1. Memory slots from different passages occupy separate slots in the circular buffer
+2. Cross-attention naturally selects the right slot based on the person's name in the question
+3. No architectural changes needed — the same mechanism scales from 1 to 2 passages
+
+**Verification**: Confirmed zero data leakage between chunks. Each chunk is a separate `model()` call with independent KV computation. The no-memory baseline (12.2%) proves the only cross-chunk channel is memory.
+
 **Summary table — all 1.5B cross-attention results:**
 
-| Experiment | QA pairs | n_extract | Best Token Acc | Best Exact Match |
-|---|---|---|---|---|
-| No memory baseline | 3 | — | 15.9% | 0% |
-| Cross-attn 15ep | 3 | 1 | 97.7% | 80% |
-| Cross-attn 15ep | 3 | 4 | 98.2% | 84% |
-| Cross-attn 15ep | 6 | 1 | 99.2% | 86% |
+| Experiment | Passages | QA pairs | Gap | Best Token Acc | Best Exact Match |
+|---|---|---|---|---|---|
+| No memory baseline | 1 | 3 | 2-6 | 15.9% | 0% |
+| Cross-attn 15ep | 1 | 3 | 2-6 | 97.7% | 80% |
+| Cross-attn n_extract=4 | 1 | 3 | 2-6 | 98.2% | 84% |
+| Cross-attn 15ep | 1 | 6 | 2-6 | 99.2% | 86% |
+| Cross-attn 15ep | 1 | 6 | 6-12 | 99.6% | 92% |
+| **Cross-attn multi** | **2** | **6 (3+3)** | **2-6** | **99.8%** | **97%** |
 
 ### Open Questions (Updated)
 
 1. ~~Does learned extraction + cross-attention improve further?~~ **Marginal — +0.5% token, +4% exact match with n_extract=4.**
 2. ~~How does accuracy scale with more QA pairs per passage?~~ **No degradation — 6 QA pairs gives higher token accuracy than 3.**
-3. How does accuracy degrade with longer gaps (more filler chunks)?
-4. Can this generalize to multi-passage recall (two passages, questions about both)?
-5. Can this generalize to multi-hop reasoning?
-6. Does hierarchical memory compression work?
-7. What does the attention pattern look like — does it attend to specific memory slots for specific questions?
-8. ~~Does extended training find a higher ceiling?~~ **Yes — 97.6% at epoch 10-15 (vs 69.8% at epoch 5 with cosine decay).**
-9. ~~Does the 1.5B model work as well as the 3B?~~ **Better — 92.7% at ep 5 vs 42.5% for 3B.**
+3. ~~How does accuracy degrade with longer gaps (more filler chunks)?~~ **No degradation — 99.6%/92% with gap 6-12.**
+4. ~~Can this generalize to multi-passage recall?~~ **Yes — 99.8%/97% with 2 passages, no interference.**
+5. Does accuracy hold with confusable facts (shared attributes between passages)?
+6. How does accuracy scale to 5-10 passages?
+7. Can this generalize to multi-hop reasoning?
+8. Does hierarchical memory compression work?
+9. What does the attention pattern look like — does it attend to specific memory slots for specific questions?
+10. ~~Does extended training find a higher ceiling?~~ **Yes — 97.6% at epoch 10-15 (vs 69.8% at epoch 5 with cosine decay).**
+11. ~~Does the 1.5B model work as well as the 3B?~~ **Better — 92.7% at ep 5 vs 42.5% for 3B.**
 
 ---
 *Last updated: 2026-03-14*
