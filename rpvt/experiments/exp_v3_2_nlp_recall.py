@@ -141,6 +141,115 @@ def _generate_single_person_facts(rng):
     return passage, all_qas
 
 
+def _generate_confusable_passage_facts(rng, n_docs, max_qa_pairs_per_passage=3):
+    """Generate documents with TWO passages that SHARE some facts.
+
+    Tests whether memory binds facts to entities (not just keyword matching).
+    Two people may share a city, organization, or field — but have different
+    codes and years. The model must use the person's name to retrieve the
+    right facts, not just match on shared attributes.
+
+    Returns list of tuples: (passage_a, passage_b, combined_qas)
+    """
+    docs = []
+    for _ in range(n_docs):
+        # Generate two people
+        name_a = _random_name(rng)
+        name_b = _random_name(rng)
+        first_a = name_a.split()[0]
+        first_b = name_b.split()[0]
+
+        # Shared attributes (pick 1-2 to share)
+        shared_city = _random_word(rng, 5, 9).capitalize()
+        shared_org = f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+        shared_field = f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+
+        n_shared = rng.randint(1, 2)  # share 1-2 attributes
+        share_what = rng.sample(["city", "org", "field"], n_shared)
+
+        city_a = shared_city if "city" in share_what else _random_word(rng, 5, 9).capitalize()
+        city_b = shared_city if "city" in share_what else _random_word(rng, 5, 9).capitalize()
+        org_a = shared_org if "org" in share_what else f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+        org_b = shared_org if "org" in share_what else f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+        field_a = shared_field if "field" in share_what else f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+        field_b = shared_field if "field" in share_what else f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+
+        # Unique numeric facts (always different)
+        code_a1, code_a2 = rng.randint(100, 999), rng.randint(100, 999)
+        code_b1, code_b2 = rng.randint(100, 999), rng.randint(100, 999)
+        year_a = rng.randint(1800, 2020)
+        year_b = rng.randint(1800, 2020)
+
+        passage_a = (
+            f"{name_a} was a researcher at {org_a} in {city_a}. "
+            f"Their work on {field_a} produced result code {code_a1}. "
+            f"The project started in {year_a} and generated output code {code_a2}. "
+            f"{first_a} specialized in {field_a} at the {city_a} campus."
+        )
+        passage_b = (
+            f"{name_b} was a researcher at {org_b} in {city_b}. "
+            f"Their work on {field_b} produced result code {code_b1}. "
+            f"The project started in {year_b} and generated output code {code_b2}. "
+            f"{first_b} specialized in {field_b} at the {city_b} campus."
+        )
+
+        qas_a = [
+            {"question": f"Where did {name_a} work?", "answer": city_a},
+            {"question": f"What organization was {name_a} part of?", "answer": org_a},
+            {"question": f"What was {name_a}'s result code?", "answer": str(code_a1)},
+            {"question": f"When did {name_a}'s project start?", "answer": str(year_a)},
+            {"question": f"What was {name_a}'s output code?", "answer": str(code_a2)},
+            {"question": f"What field did {name_a} work in?", "answer": field_a},
+        ]
+        qas_b = [
+            {"question": f"Where did {name_b} work?", "answer": city_b},
+            {"question": f"What organization was {name_b} part of?", "answer": org_b},
+            {"question": f"What was {name_b}'s result code?", "answer": str(code_b1)},
+            {"question": f"When did {name_b}'s project start?", "answer": str(year_b)},
+            {"question": f"What was {name_b}'s output code?", "answer": str(code_b2)},
+            {"question": f"What field did {name_b} work in?", "answer": field_b},
+        ]
+
+        selected_a = rng.sample(qas_a, min(max_qa_pairs_per_passage, len(qas_a)))
+        selected_b = rng.sample(qas_b, min(max_qa_pairs_per_passage, len(qas_b)))
+
+        combined_qas = []
+        for qa_a, qa_b in zip(selected_a, selected_b):
+            combined_qas.append(qa_a)
+            combined_qas.append(qa_b)
+        combined_qas.extend(selected_a[len(selected_b):])
+        combined_qas.extend(selected_b[len(selected_a):])
+
+        docs.append((passage_a, passage_b, combined_qas))
+    return docs
+
+
+def _generate_n_passage_facts(rng, n_docs, n_passages=5, max_qa_pairs_per_passage=2):
+    """Generate documents with N passages about different people.
+
+    Tests memory capacity and attention selectivity — the model must pick
+    the right slot out of N passage slots when answering questions.
+
+    Returns list of tuples: (list_of_passages, combined_qas)
+    """
+    docs = []
+    for _ in range(n_docs):
+        passages = []
+        all_selected_qas = []
+
+        for _ in range(n_passages):
+            passage, qas = _generate_single_person_facts(rng)
+            passages.append(passage)
+            selected = rng.sample(qas, min(max_qa_pairs_per_passage, len(qas)))
+            all_selected_qas.extend(selected)
+
+        # Shuffle QA pairs so questions about different people are interleaved
+        rng.shuffle(all_selected_qas)
+
+        docs.append((passages, all_selected_qas))
+    return docs
+
+
 def _generate_multi_passage_facts(rng, n_docs, max_qa_pairs_per_passage=3):
     """Generate documents with TWO passages about different people.
 
@@ -254,6 +363,27 @@ class SQuADRecallDataset(Dataset):
             # Will be handled separately below
             passage_qas = None
 
+        elif data_source == "synthetic_confusable":
+            print(f"  Generating {n_docs} confusable multi-passage documents...")
+            multi_docs = _generate_confusable_passage_facts(
+                rng, n_docs, max_qa_pairs_per_passage=max_qa_pairs
+            )
+            passage_qas = None
+
+        elif data_source.startswith("synthetic_n_"):
+            # e.g. "synthetic_n_5" for 5 passages
+            n_passages = int(data_source.split("_")[-1])
+            # Fewer QA per person to keep QA chunk manageable
+            qa_per_person = min(max_qa_pairs, 2)
+            print(f"  Generating {n_docs} documents with {n_passages} passages ({qa_per_person} QA each)...")
+            n_passage_docs = _generate_n_passage_facts(
+                rng, n_docs, n_passages=n_passages,
+                max_qa_pairs_per_passage=qa_per_person,
+            )
+            # Will be handled separately below
+            passage_qas = None
+            multi_docs = None
+
         else:
             raise ValueError(f"Unknown data_source: {data_source}")
 
@@ -266,7 +396,7 @@ class SQuADRecallDataset(Dataset):
 
         self.documents = []
 
-        if data_source == "synthetic_multi":
+        if data_source in ("synthetic_multi", "synthetic_confusable"):
             # Multi-passage: [PassageA] [filler] [PassageB] [filler] [QA about both]
             for doc_idx in range(len(multi_docs)):
                 passage_a, passage_b, combined_qas = multi_docs[doc_idx]
@@ -330,6 +460,74 @@ class SQuADRecallDataset(Dataset):
                     "gap": gap_a + gap_b,
                     "n_passage_chunks": n_passage,
                     "context": f"{passage_a}\n---\n{passage_b}",
+                })
+        elif data_source.startswith("synthetic_n_"):
+            # N-passage: [P1] [filler] [P2] [filler] ... [PN] [filler] [QA about all]
+            for doc_idx in range(len(n_passage_docs)):
+                passages, combined_qas = n_passage_docs[doc_idx]
+
+                def _make_chunks(text):
+                    tokens = tokenizer.encode(text, add_special_tokens=False)
+                    chunks = []
+                    for i in range(0, len(tokens), chunk_size):
+                        ct = tokens[i:i + chunk_size]
+                        if len(ct) < chunk_size:
+                            pad_id = tokenizer.eos_token_id or 0
+                            ct = ct + [pad_id] * (chunk_size - len(ct))
+                        chunks.append(torch.tensor(ct, dtype=torch.long))
+                    return chunks
+
+                def _make_filler(n):
+                    chunks = []
+                    for _ in range(n):
+                        ft = rng.choice(filler_texts)
+                        ft_tok = tokenizer.encode(ft, add_special_tokens=False)
+                        if len(ft_tok) >= chunk_size:
+                            start = rng.randint(0, len(ft_tok) - chunk_size)
+                            ct = ft_tok[start:start + chunk_size]
+                        else:
+                            pad_id = tokenizer.eos_token_id or 0
+                            ct = ft_tok + [pad_id] * (chunk_size - len(ft_tok))
+                        chunks.append(torch.tensor(ct, dtype=torch.long))
+                    return chunks
+
+                all_chunks = []
+                n_passage_total = 0
+                total_gap = 0
+                for passage in passages:
+                    p_chunks = _make_chunks(passage)
+                    gap = rng.randint(gap_range[0], gap_range[1])
+                    f_chunks = _make_filler(gap)
+                    all_chunks.extend(p_chunks)
+                    all_chunks.extend(f_chunks)
+                    n_passage_total += len(p_chunks)
+                    total_gap += gap
+
+                # Build QA chunk
+                qa_text = ""
+                for qa in combined_qas:
+                    qa_text += f" Q: {qa['question']} A: {qa['answer']}"
+                qa_text = qa_text.strip()
+
+                qa_tokens = tokenizer.encode(qa_text, add_special_tokens=False)
+                answer_mask = self._build_answer_mask(qa_text, combined_qas, tokenizer, chunk_size)
+
+                if len(qa_tokens) >= chunk_size:
+                    qa_tokens = qa_tokens[:chunk_size]
+                else:
+                    pad_id = tokenizer.eos_token_id or 0
+                    qa_tokens = qa_tokens + [pad_id] * (chunk_size - len(qa_tokens))
+                qa_chunk = torch.tensor(qa_tokens, dtype=torch.long)
+
+                all_chunks.append(qa_chunk)
+
+                self.documents.append({
+                    "chunks": all_chunks,
+                    "answer_mask": answer_mask,
+                    "qa_pairs": combined_qas,
+                    "gap": total_gap,
+                    "n_passage_chunks": n_passage_total,
+                    "context": "\n---\n".join(passages),
                 })
         else:
             # Single-passage: [Passage] [filler] [QA]
@@ -975,8 +1173,9 @@ def main():
 
     # Task
     parser.add_argument("--data-source", type=str, default="synthetic",
-                        choices=["synthetic", "squad", "synthetic_multi"],
-                        help="Data source: 'synthetic' (single passage), 'synthetic_multi' (two passages), or 'squad'")
+                        help="Data source: 'synthetic' (single), 'synthetic_multi' (two passages), "
+                             "'synthetic_confusable' (two passages sharing attributes), "
+                             "'synthetic_n_N' (N passages, e.g. synthetic_n_5), or 'squad'")
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--max-qa-pairs", type=int, default=3)
     parser.add_argument("--gap-min", type=int, default=2)
