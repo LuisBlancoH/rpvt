@@ -112,6 +112,118 @@ def _generate_synthetic_facts(rng, n_docs, max_qa_pairs):
     return docs
 
 
+def _generate_natural_facts(rng, n_docs, max_qa_pairs):
+    """Generate synthetic passages with natural-sounding varied text.
+
+    Like _generate_synthetic_facts but with diverse sentence structures
+    and more natural phrasing. Still uses random entities to prevent
+    parametric knowledge from helping.
+    """
+    # Templates for varied passage structure
+    passage_templates = [
+        (
+            "Born in {city}, {name} spent most of their career at {org}. "
+            "Their groundbreaking research in {field} led to the discovery of compound {code_a} in {year}. "
+            "The team also identified variant {code_b} during a follow-up study. "
+            "{first} was widely recognized for contributions to {field}."
+        ),
+        (
+            "{name} joined {org} in {year} after completing studies in {field}. "
+            "Based at the {city} campus, {first} published extensively on {field}. "
+            "Their most cited paper reported findings coded as {code_a}, "
+            "while a related experiment yielded result {code_b}."
+        ),
+        (
+            "The {city} branch of {org} appointed {name} as lead investigator in {year}. "
+            "Under {first}'s direction, the lab focused on {field} and achieved "
+            "a major milestone with experiment {code_a}. "
+            "A secondary outcome, designated {code_b}, was also significant."
+        ),
+        (
+            "Working out of {city}, {name} established a new laboratory at {org}. "
+            "The lab's primary focus was {field}, an area {first} had studied since {year}. "
+            "Notable outputs included protocol {code_a} and its derivative protocol {code_b}."
+        ),
+        (
+            "{name} relocated to {city} in {year} to accept a position at {org}. "
+            "There, {first} pioneered new approaches to {field}. "
+            "The research produced two key results: finding {code_a} and observation {code_b}. "
+            "{first}'s work at the {city} facility became highly influential."
+        ),
+        (
+            "At {org} in {city}, {name} led a team investigating {field}. "
+            "Starting in {year}, the project ran for several years and produced "
+            "result {code_a} as its primary finding. "
+            "An unexpected secondary finding, {code_b}, opened new research directions. "
+            "{first} continued working on {field} throughout their tenure."
+        ),
+    ]
+
+    # Varied question phrasings per fact type
+    question_templates = {
+        "city": [
+            "Where was {name} based?",
+            "In which city did {name} work?",
+            "Where did {name}'s research take place?",
+        ],
+        "org": [
+            "Which institution employed {name}?",
+            "What organization did {name} work for?",
+            "Where was {name} appointed?",
+        ],
+        "code_a": [
+            "What was {name}'s primary finding?",
+            "What result did {name}'s research produce?",
+            "What was the main result code from {name}'s work?",
+        ],
+        "year": [
+            "When did {name} begin their work?",
+            "In what year did {name}'s project start?",
+            "When did {name} join their institution?",
+        ],
+        "code_b": [
+            "What was {name}'s secondary finding?",
+            "What was the follow-up result from {name}'s research?",
+            "What secondary result did {name} report?",
+        ],
+        "field": [
+            "What field did {name} specialize in?",
+            "What area of research was {name} known for?",
+            "What did {name} study?",
+        ],
+    }
+
+    docs = []
+    for _ in range(n_docs):
+        name = _random_name(rng)
+        first = name.split()[0]
+        city = _random_word(rng, 5, 9).capitalize()
+        org = f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council', 'Center', 'Laboratory', 'Agency'])}"
+        field = f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering', 'biology', 'chemistry', 'physics', 'studies'])}"
+        code_a = rng.randint(100, 999)
+        code_b = rng.randint(100, 999)
+        year = rng.randint(1800, 2020)
+
+        template = rng.choice(passage_templates)
+        passage = template.format(
+            name=name, first=first, city=city, org=org,
+            field=field, code_a=code_a, code_b=code_b, year=year,
+        )
+
+        all_qas = [
+            {"question": rng.choice(question_templates["city"]).format(name=name), "answer": city},
+            {"question": rng.choice(question_templates["org"]).format(name=name), "answer": org},
+            {"question": rng.choice(question_templates["code_a"]).format(name=name), "answer": str(code_a)},
+            {"question": rng.choice(question_templates["year"]).format(name=name), "answer": str(year)},
+            {"question": rng.choice(question_templates["code_b"]).format(name=name), "answer": str(code_b)},
+            {"question": rng.choice(question_templates["field"]).format(name=name), "answer": field},
+        ]
+        selected_qas = rng.sample(all_qas, min(max_qa_pairs, len(all_qas)))
+        docs.append((passage, selected_qas))
+
+    return docs
+
+
 def _generate_single_person_facts(rng):
     """Generate a single person's passage and QA pairs."""
     name = _random_name(rng)
@@ -353,6 +465,11 @@ class SQuADRecallDataset(Dataset):
         elif data_source == "synthetic":
             print(f"  Generating {n_docs} synthetic passages...")
             generated = _generate_synthetic_facts(rng, n_docs, max_qa_pairs)
+            passage_qas = generated
+
+        elif data_source == "synthetic_natural":
+            print(f"  Generating {n_docs} natural-style passages...")
+            generated = _generate_natural_facts(rng, n_docs, max_qa_pairs)
             passage_qas = generated
 
         elif data_source == "synthetic_multi":
