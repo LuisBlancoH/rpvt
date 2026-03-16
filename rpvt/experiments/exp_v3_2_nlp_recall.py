@@ -253,6 +253,122 @@ def _generate_single_person_facts(rng):
     return passage, all_qas
 
 
+def _generate_reasoning_facts(rng, n_docs, max_qa_pairs_per_passage=3):
+    """Generate documents with TWO passages and cross-document reasoning questions.
+
+    Questions require comparing or combining facts from both passages:
+    - "Who started first?" (compare years)
+    - "What is the sum of X's code and Y's code?" (arithmetic)
+    - "Did X and Y work in the same city?" (comparison)
+    - Standard recall questions interleaved for baseline
+
+    Returns list of tuples: (passage_a, passage_b, combined_qas)
+    """
+    passage_templates = [
+        (
+            "{name} joined {org} in {year} after completing studies in {field}. "
+            "Based at the {city} campus, {first} published extensively on {field}. "
+            "Their most cited paper reported findings coded as {code_a}, "
+            "while a related experiment yielded result {code_b}."
+        ),
+        (
+            "Born in {city}, {name} spent most of their career at {org}. "
+            "Their groundbreaking research in {field} led to the discovery of compound {code_a} in {year}. "
+            "The team also identified variant {code_b} during a follow-up study. "
+            "{first} was widely recognized for contributions to {field}."
+        ),
+        (
+            "At {org} in {city}, {name} led a team investigating {field}. "
+            "Starting in {year}, the project ran for several years and produced "
+            "result {code_a} as its primary finding. "
+            "An unexpected secondary finding, {code_b}, opened new research directions."
+        ),
+    ]
+
+    docs = []
+    for _ in range(n_docs):
+        # Generate two people with distinct facts
+        name_a = _random_name(rng)
+        name_b = _random_name(rng)
+        first_a = name_a.split()[0]
+        first_b = name_b.split()[0]
+
+        city_a = _random_word(rng, 5, 9).capitalize()
+        city_b = _random_word(rng, 5, 9).capitalize()
+        org_a = f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+        org_b = f"the {_random_word(rng, 5, 8).capitalize()} {rng.choice(['Institute', 'Foundation', 'Society', 'Bureau', 'Council'])}"
+        field_a = f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+        field_b = f"{_random_word(rng, 4, 7)} {rng.choice(['theory', 'dynamics', 'analysis', 'systems', 'engineering'])}"
+        code_a1, code_a2 = rng.randint(100, 999), rng.randint(100, 999)
+        code_b1, code_b2 = rng.randint(100, 999), rng.randint(100, 999)
+        year_a = rng.randint(1800, 2020)
+        year_b = rng.randint(1800, 2020)
+        # Ensure years are different for comparison questions
+        while year_b == year_a:
+            year_b = rng.randint(1800, 2020)
+
+        template_a = rng.choice(passage_templates)
+        template_b = rng.choice(passage_templates)
+        passage_a = template_a.format(
+            name=name_a, first=first_a, city=city_a, org=org_a,
+            field=field_a, code_a=code_a1, code_b=code_a2, year=year_a,
+        )
+        passage_b = template_b.format(
+            name=name_b, first=first_b, city=city_b, org=org_b,
+            field=field_b, code_a=code_b1, code_b=code_b2, year=year_b,
+        )
+
+        # Build reasoning questions (require info from both passages)
+        earlier = name_a if year_a < year_b else name_b
+        later = name_b if year_a < year_b else name_a
+        earlier_year = min(year_a, year_b)
+        later_year = max(year_a, year_b)
+        year_diff = later_year - earlier_year
+        code_sum = code_a1 + code_b1
+        same_city = "yes" if city_a == city_b else "no"
+
+        reasoning_qas = [
+            {
+                "question": f"Who started their project first, {name_a} or {name_b}?",
+                "answer": earlier.split()[0],
+                "type": "comparison",
+            },
+            {
+                "question": f"How many years apart did {name_a} and {name_b} start their projects?",
+                "answer": str(year_diff),
+                "type": "arithmetic",
+            },
+            {
+                "question": f"What is the sum of {name_a}'s primary result code and {name_b}'s primary result code?",
+                "answer": str(code_sum),
+                "type": "arithmetic",
+            },
+            {
+                "question": f"Did {name_a} and {name_b} work in the same city?",
+                "answer": same_city,
+                "type": "comparison",
+            },
+            {
+                "question": f"Who had the higher primary result code, {name_a} or {name_b}?",
+                "answer": (name_a if code_a1 > code_b1 else name_b).split()[0],
+                "type": "comparison",
+            },
+        ]
+
+        # Also include some standard recall questions
+        recall_qas = [
+            {"question": f"What was {name_a}'s primary result code?", "answer": str(code_a1), "type": "recall"},
+            {"question": f"When did {name_b}'s project start?", "answer": str(year_b), "type": "recall"},
+        ]
+
+        # Mix reasoning and recall questions
+        all_qas = reasoning_qas + recall_qas
+        selected = rng.sample(all_qas, min(max_qa_pairs_per_passage * 2, len(all_qas)))
+
+        docs.append((passage_a, passage_b, selected))
+    return docs
+
+
 def _generate_confusable_passage_facts(rng, n_docs, max_qa_pairs_per_passage=3):
     """Generate documents with TWO passages that SHARE some facts.
 
@@ -480,6 +596,13 @@ class SQuADRecallDataset(Dataset):
             # Will be handled separately below
             passage_qas = None
 
+        elif data_source == "synthetic_reasoning":
+            print(f"  Generating {n_docs} reasoning documents (comparison + arithmetic)...")
+            multi_docs = _generate_reasoning_facts(
+                rng, n_docs, max_qa_pairs_per_passage=max_qa_pairs
+            )
+            passage_qas = None
+
         elif data_source == "synthetic_confusable":
             print(f"  Generating {n_docs} confusable multi-passage documents...")
             multi_docs = _generate_confusable_passage_facts(
@@ -513,7 +636,7 @@ class SQuADRecallDataset(Dataset):
 
         self.documents = []
 
-        if data_source in ("synthetic_multi", "synthetic_confusable"):
+        if data_source in ("synthetic_multi", "synthetic_confusable", "synthetic_reasoning"):
             # Multi-passage: [PassageA] [filler] [PassageB] [filler] [QA about both]
             for doc_idx in range(len(multi_docs)):
                 passage_a, passage_b, combined_qas = multi_docs[doc_idx]
