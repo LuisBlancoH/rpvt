@@ -186,8 +186,42 @@ class WriteWrapper(nn.Module):
         return outputs  # pass through unchanged — no additive injection
 
 
+def _get_rotary_and_attention_fns(attn_module):
+    """Dynamically import RoPE and attention functions for the model type."""
+    module_name = type(attn_module).__module__
+    if "qwen2" in module_name:
+        from transformers.models.qwen2.modeling_qwen2 import (
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+        )
+        return apply_rotary_pos_emb, eager_attention_forward
+    elif "llama" in module_name:
+        from transformers.models.llama.modeling_llama import (
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+        )
+        return apply_rotary_pos_emb, eager_attention_forward
+    elif "phi" in module_name:
+        from transformers.models.phi.modeling_phi import (
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+        )
+        return apply_rotary_pos_emb, eager_attention_forward
+    elif "mistral" in module_name:
+        from transformers.models.mistral.modeling_mistral import (
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+        )
+        return apply_rotary_pos_emb, eager_attention_forward
+    else:
+        # Generic fallback — most HF models have these in their module
+        import importlib
+        mod = importlib.import_module(module_name)
+        return mod.apply_rotary_pos_emb, mod.eager_attention_forward
+
+
 class MemoryAugmentedAttention(nn.Module):
-    """Wraps a Qwen2Attention to inject memory KV pairs.
+    """Wraps any HuggingFace attention layer to inject memory KV pairs.
 
     Memory hidden states are projected through the layer's own k_proj/v_proj,
     then concatenated to the regular KV pairs before attention computation.
@@ -195,12 +229,16 @@ class MemoryAugmentedAttention(nn.Module):
 
     The model's own query heads naturally decide whether to attend to
     memory or regular context via softmax attention weights.
+
+    Supports Qwen2, Llama, Phi, Mistral, and other HF models with
+    standard q_proj/k_proj/v_proj/o_proj attention layers.
     """
 
     def __init__(self, original_attn, memory_bank: MemoryBank):
         super().__init__()
         self.attn = original_attn
         self.memory_bank = memory_bank
+        self._rope_fn, self._attn_fn = _get_rotary_and_attention_fns(original_attn)
 
     def __getattr__(self, name):
         try:
@@ -215,10 +253,8 @@ class MemoryAugmentedAttention(nn.Module):
         attention_mask=None,
         **kwargs,
     ):
-        from transformers.models.qwen2.modeling_qwen2 import (
-            apply_rotary_pos_emb,
-            eager_attention_forward,
-        )
+        apply_rotary_pos_emb = self._rope_fn
+        eager_attention_forward = self._attn_fn
 
         input_shape = hidden_states.shape[:-1]
         batch_size = input_shape[0]
