@@ -548,6 +548,87 @@ Two passages about different people, with interleaved QA about both. Tests wheth
 
 **Verification**: Confirmed zero data leakage between chunks. Each chunk is a separate `model()` call with independent KV computation. The no-memory baseline (12.2%) proves the only cross-chunk channel is memory.
 
+### Key Discovery 29: Confusable Facts — Shared Attributes Make No Difference
+
+Tested with 2 passages sharing 1-2 attributes (organization, field, city) to check whether the model relies on keyword matching or genuine entity binding.
+
+**Result** (1.5B, 2 passages, 3 QA per person = 6 total, 15 epochs):
+
+| Condition | Token Accuracy | Exact Match |
+|---|---|---|
+| Multi-passage (distinct) | 99.8% | 97% |
+| **Multi-passage (confusable)** | **99.8%** | **97%** |
+
+**Identical performance.** The model binds facts to entities via the person's name, not keyword matching. Shared attributes between passages cause zero confusion — cross-attention selects the correct memory slot based on the entity name in the question, not surface-level attribute overlap.
+
+### Key Discovery 30: 5-Passage Scaling — 100% Perfect Score
+
+Scaled from 2 to 5 passages per document, each about a different person. 10 QA pairs total (2 per person).
+
+**Result** (1.5B, 5 passages, 2 QA per person = 10 total, 15 epochs):
+
+| Epoch | Token Accuracy | Exact Match |
+|---|---|---|
+| Baseline (no mem) | ~10% | 0% |
+| 3 | ~98% | ~90% |
+| 7 | **100.0%** | **100.0%** |
+| 8-15 | 100.0% | 100.0% |
+
+**Perfect score from epoch 7 onward.** No degradation whatsoever going from 2 to 5 passages. The circular buffer and cross-attention mechanism scale naturally — each passage occupies its own memory slots, and the model selects the right slots for each question.
+
+### Key Discovery 31: Generalization — Memory Skill Transfers Across Formats
+
+Tested whether the memory skill learned on single-passage synthetic data transfers to unseen formats without any retraining.
+
+**Cross-format evaluation** (trained on single-passage synthetic, evaluated on other formats):
+
+| Train format | Eval format | Token Accuracy |
+|---|---|---|
+| Single-passage synthetic | Multi-passage (2 passages) | 98.0% |
+| Single-passage synthetic | 5-passage | 98.1% |
+| Single-passage synthetic | SQuAD (real Wikipedia) | 86.0% |
+| No memory baseline | SQuAD | 55.5% |
+
+**The model learned "how to use memory" as a general skill**, not a format-specific trick. Zero retraining needed — a checkpoint trained only on single-passage synthetic facts can recall information from multiple passages and even real Wikipedia articles. The +30.5% improvement on SQuAD over the no-memory baseline is especially striking given the model was never trained on that format.
+
+### Key Discovery 32: Natural-Style Training Improves Generalization
+
+Trained with more diverse passage templates (6 varied templates) and question phrasings (3 per fact type) to improve cross-format transfer.
+
+**Result** (1.5B, 15 epochs, natural-style training):
+
+| Eval format | Natural-trained | Synthetic-trained | No memory |
+|---|---|---|---|
+| Natural format | 99.2% | — | ~10% |
+| Synthetic format (cross-format) | 98.5% | 97.7% | ~10% |
+| SQuAD (real Wikipedia) | **90.4%** | 86.0% | 55.5% |
+
+**Key findings:**
+1. **+35 point improvement on real Wikipedia from memory alone** (90.4% vs 55.5% no-memory)
+2. Natural-style training improves SQuAD generalization by +4.4% over synthetic training (90.4% vs 86.0%)
+3. Cross-format transfer works in both directions — natural-trained model gets 98.5% on synthetic format
+4. Template and question diversity during training helps the model generalize to real-world text
+
+### Key Discovery 33: Streaming Document QA on Real Wikipedia
+
+End-to-end test: process real Wikipedia articles chunk-by-chunk (streaming), accumulate memory across chunks, then answer questions about the article content.
+
+**Result** (1.5B, natural-trained checkpoint, zero additional training):
+
+| Question type | Token Accuracy | Exact Match | Questions | Articles |
+|---|---|---|---|---|
+| Numbers only | **100.0%** | **100.0%** | 227 | 48 |
+| Diverse (entities, locations, numbers) | **97.3%** | **73.9%** | 364 | 49 |
+| No-memory baseline | 39.7% | — | — | — |
+
+**Key findings:**
+1. **Perfect recall on numerical facts** — 100%/100% on 227 questions across 48 Wikipedia articles
+2. **97.3% token accuracy on diverse questions** — entities and locations are harder due to novel subword tokens
+3. **73.9% exact match on diverse questions** — lower because entity names must match every character exactly
+4. **+57.6% token accuracy over no-memory baseline** (97.3% vs 39.7%)
+5. **Zero additional training** — uses the natural-trained checkpoint directly on real Wikipedia
+6. This is a genuine streaming architecture — each chunk is processed independently, memory is the only cross-chunk channel
+
 **Summary table — all 1.5B cross-attention results:**
 
 | Experiment | Passages | QA pairs | Gap | Best Token Acc | Best Exact Match |
@@ -557,7 +638,16 @@ Two passages about different people, with interleaved QA about both. Tests wheth
 | Cross-attn n_extract=4 | 1 | 3 | 2-6 | 98.2% | 84% |
 | Cross-attn 15ep | 1 | 6 | 2-6 | 99.2% | 86% |
 | Cross-attn 15ep | 1 | 6 | 6-12 | 99.6% | 92% |
-| **Cross-attn multi** | **2** | **6 (3+3)** | **2-6** | **99.8%** | **97%** |
+| Cross-attn multi | 2 | 6 (3+3) | 2-6 | 99.8% | 97% |
+| Cross-attn confusable | 2 | 6 (3+3) | 2-6 | 99.8% | 97% |
+| Cross-attn 5-passage | 5 | 10 (2×5) | 2-6 | 100.0% | 100.0% |
+| Generalization: multi-passage | 2 | 6 (3+3) | 2-6 | 98.0% | — |
+| Generalization: 5-passage | 5 | 10 (2×5) | 2-6 | 98.1% | — |
+| Generalization: SQuAD | 1 | varies | — | 86.0% | — |
+| Natural-trained: synthetic | 1 | varies | 2-6 | 98.5% | — |
+| Natural-trained: SQuAD | 1 | varies | — | 90.4% | — |
+| **Streaming Wikipedia (numbers)** | **1** | **varies** | **—** | **100.0%** | **100.0%** |
+| **Streaming Wikipedia (diverse)** | **1** | **varies** | **—** | **97.3%** | **73.9%** |
 
 ### Open Questions (Updated)
 
@@ -565,13 +655,19 @@ Two passages about different people, with interleaved QA about both. Tests wheth
 2. ~~How does accuracy scale with more QA pairs per passage?~~ **No degradation — 6 QA pairs gives higher token accuracy than 3.**
 3. ~~How does accuracy degrade with longer gaps (more filler chunks)?~~ **No degradation — 99.6%/92% with gap 6-12.**
 4. ~~Can this generalize to multi-passage recall?~~ **Yes — 99.8%/97% with 2 passages, no interference.**
-5. Does accuracy hold with confusable facts (shared attributes between passages)?
-6. How does accuracy scale to 5-10 passages?
+5. ~~Does accuracy hold with confusable facts (shared attributes between passages)?~~ **Yes — 99.8%/97%, identical to distinct passages. Model binds facts by entity name.**
+6. ~~How does accuracy scale to 5-10 passages?~~ **5 passages: 100%/100% from epoch 7. No degradation.**
 7. Can this generalize to multi-hop reasoning?
 8. Does hierarchical memory compression work?
 9. What does the attention pattern look like — does it attend to specific memory slots for specific questions?
 10. ~~Does extended training find a higher ceiling?~~ **Yes — 97.6% at epoch 10-15 (vs 69.8% at epoch 5 with cosine decay).**
 11. ~~Does the 1.5B model work as well as the 3B?~~ **Better — 92.7% at ep 5 vs 42.5% for 3B.**
+12. ~~Does the memory skill transfer across formats?~~ **Yes — train on synthetic, eval on multi-passage (98%), SQuAD (86%), no retraining needed.**
+13. ~~Does natural-style training improve generalization?~~ **Yes — 90.4% on SQuAD (vs 86% from synthetic training). +35 points over no-memory baseline.**
+14. ~~Does streaming document QA work on real Wikipedia?~~ **Yes — 100%/100% on numbers, 97.3%/73.9% on diverse questions. Zero additional training.**
+15. How does accuracy scale to 10+ passages?
+16. Can the architecture handle documents longer than ~2K tokens?
+17. Does fine-tuning on real Wikipedia QA data further improve streaming performance?
 
 ---
-*Last updated: 2026-03-14*
+*Last updated: 2026-03-15*
