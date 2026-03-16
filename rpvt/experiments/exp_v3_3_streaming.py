@@ -97,11 +97,10 @@ def extract_qa_from_article(text, tokenizer, rng, n_questions=5, chunk_size=128)
         if len(sent) < 30 or len(sent) > 200:
             continue
 
-        # Look for sentences with numbers (years, quantities)
+        # Type 1: Numbers (years, quantities)
         numbers = re.findall(r'\b(\d{3,})\b', sent)
         if numbers:
             for num in numbers[:1]:
-                # Find what the number refers to
                 idx = sent.index(num)
                 context = sent[:idx].strip().rstrip(',').strip()
                 if len(context) > 10:
@@ -109,10 +108,62 @@ def extract_qa_from_article(text, tokenizer, rng, n_questions=5, chunk_size=128)
                         "question": f"According to the article, what number is associated with: {context}?",
                         "answer": num,
                         "source_sentence": sent,
+                        "type": "number",
                     })
 
-    rng.shuffle(qa_pairs)
-    return qa_pairs[:n_questions]
+        # Type 2: Named entities — "X was/is a/the Y" patterns
+        # e.g. "Tatwine was an Anglo-Saxon archbishop"
+        m = re.match(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:was|is|are|were)\s+(?:a|an|the)\s+(.+?)(?:\.|,|;)', sent)
+        if m:
+            name = m.group(1)
+            description = m.group(2).strip()
+            if len(description) > 3 and len(description) < 60 and len(name.split()) <= 4:
+                qa_pairs.append({
+                    "question": f"According to the article, what was {name}?",
+                    "answer": description,
+                    "source_sentence": sent,
+                    "type": "entity_description",
+                })
+
+        # Type 3: Location — "in/at/from X" where X is capitalized
+        loc_match = re.findall(r'(?:in|at|from|near)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', sent)
+        if loc_match:
+            for loc in loc_match[:1]:
+                if len(loc) > 2 and len(loc) < 30 and loc not in ("The", "This", "That", "These", "In", "At"):
+                    # Use the subject of the sentence as context
+                    subject = sent.split(" was ")[0] if " was " in sent else sent.split(",")[0]
+                    if len(subject) > 5 and len(subject) < 80:
+                        qa_pairs.append({
+                            "question": f"According to the article, what location is associated with: {subject}?",
+                            "answer": loc,
+                            "source_sentence": sent,
+                            "type": "location",
+                        })
+
+        # Type 4: "X of Y" or "X by Y" — relationships
+        rel_match = re.findall(r'(?:the\s+)?([a-z]+)\s+of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', sent)
+        if rel_match:
+            for rel, entity in rel_match[:1]:
+                if rel in ("king", "queen", "duke", "battle", "city", "university",
+                           "president", "founder", "capital", "author", "bishop",
+                           "son", "daughter", "wife", "husband", "leader", "head"):
+                    qa_pairs.append({
+                        "question": f"According to the article, who or what is the {rel} of {entity}?",
+                        "answer": sent.split(f"{rel} of {entity}")[0].strip().split(",")[-1].strip() if f"{rel} of {entity}" in sent else entity,
+                        "source_sentence": sent,
+                        "type": "relationship",
+                    })
+
+    # Deduplicate by answer
+    seen_answers = set()
+    unique_qa = []
+    for qa in qa_pairs:
+        if qa["answer"] not in seen_answers:
+            seen_answers.add(qa["answer"])
+            unique_qa.append(qa)
+
+    rng.shuffle(unique_qa)
+    return unique_qa[:n_questions]
 
 
 def streaming_eval(

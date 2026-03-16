@@ -1,0 +1,468 @@
+{
+  "token_accuracy": 0.9731404958677686,
+  "exact_match": 0.739010989010989,
+  "total_articles": 49,
+  "total_questions": 364,
+  "total_tokens": 968,
+  "correct_tokens": 942,
+  "per_article": [
+    {
+      "title": "Manila",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.8260869565217391,
+      "correct_tokens": 38,
+      "total_tokens": 46,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "2003 Pacific typhoon season",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 24,
+      "total_tokens": 24,
+      "exact_match_questions": 8
+    },
+    {
+      "title": "Commonwealth War Graves Commission",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 23,
+      "total_tokens": 23,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Temnospondyli",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.96,
+      "correct_tokens": 24,
+      "total_tokens": 25,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Clayton Kershaw",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.9393939393939394,
+      "correct_tokens": 31,
+      "total_tokens": 33,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Operation Eastern Exit",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 16,
+      "total_tokens": 16,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Tatwine",
+      "n_chunks": 5,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 19,
+      "total_tokens": 19,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Nerva",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 22,
+      "total_tokens": 22,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Olmec colossal heads",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.9545454545454546,
+      "correct_tokens": 21,
+      "total_tokens": 22,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Imagism",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 21,
+      "total_tokens": 21,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Little Gidding ( poem )",
+      "n_chunks": 16,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 22,
+      "total_tokens": 22,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "American Beauty ( 1999 film )",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 7,
+      "total_tokens": 7,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "Light Tank Mk VII Tetrarch",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 9,
+      "total_tokens": 9,
+      "exact_match_questions": 3
+    },
+    {
+      "title": "Bintulu",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 23,
+      "total_tokens": 23,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "No. 20 Squadron RAAF",
+      "n_chunks": 15,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 21,
+      "total_tokens": 21,
+      "exact_match_questions": 8
+    },
+    {
+      "title": "Chad at the 2008 Summer Olympics",
+      "n_chunks": 11,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 19,
+      "total_tokens": 19,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "Ise @-@ class battleship",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 23,
+      "total_tokens": 23,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "2010 Claxton Shield",
+      "n_chunks": 12,
+      "n_questions": 8,
+      "token_accuracy": 0.9714285714285714,
+      "correct_tokens": 34,
+      "total_tokens": 35,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Operation USA",
+      "n_chunks": 10,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 26,
+      "total_tokens": 26,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Dick Rifenburg",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.967741935483871,
+      "correct_tokens": 30,
+      "total_tokens": 31,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "The Snowmen",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 11,
+      "total_tokens": 11,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "The Portage to San Cristobal of A.H.",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 10,
+      "total_tokens": 10,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "The Heart of Ezra Greer",
+      "n_chunks": 10,
+      "n_questions": 4,
+      "token_accuracy": 1.0,
+      "correct_tokens": 6,
+      "total_tokens": 6,
+      "exact_match_questions": 2
+    },
+    {
+      "title": "Independiente ( Ricardo Arjona album )",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 14,
+      "total_tokens": 14,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "Free Derry",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.9545454545454546,
+      "correct_tokens": 21,
+      "total_tokens": 22,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "Oxaziridine",
+      "n_chunks": 20,
+      "n_questions": 1,
+      "token_accuracy": 1.0,
+      "correct_tokens": 2,
+      "total_tokens": 2,
+      "exact_match_questions": 1
+    },
+    {
+      "title": "Robert Boulter",
+      "n_chunks": 11,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 17,
+      "total_tokens": 17,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "View of the World from 9th Avenue",
+      "n_chunks": 12,
+      "n_questions": 8,
+      "token_accuracy": 0.96,
+      "correct_tokens": 24,
+      "total_tokens": 25,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Battle of D\u00fcrenstein",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 17,
+      "total_tokens": 17,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Kirby 's Block Ball",
+      "n_chunks": 10,
+      "n_questions": 5,
+      "token_accuracy": 1.0,
+      "correct_tokens": 11,
+      "total_tokens": 11,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "Head VI",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 29,
+      "total_tokens": 29,
+      "exact_match_questions": 8
+    },
+    {
+      "title": "The Hustler ( film )",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 20,
+      "total_tokens": 20,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Brock Lesnar",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.9333333333333333,
+      "correct_tokens": 14,
+      "total_tokens": 15,
+      "exact_match_questions": 3
+    },
+    {
+      "title": "Weevils Wobble But They Don 't Go Down",
+      "n_chunks": 14,
+      "n_questions": 3,
+      "token_accuracy": 1.0,
+      "correct_tokens": 8,
+      "total_tokens": 8,
+      "exact_match_questions": 2
+    },
+    {
+      "title": "Osbert de Bayeux",
+      "n_chunks": 10,
+      "n_questions": 8,
+      "token_accuracy": 0.9393939393939394,
+      "correct_tokens": 31,
+      "total_tokens": 33,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Shackleton ( crater )",
+      "n_chunks": 15,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 29,
+      "total_tokens": 29,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "New York State Route 93",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 15,
+      "total_tokens": 15,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Nero",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.8636363636363636,
+      "correct_tokens": 19,
+      "total_tokens": 22,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "QuackShot",
+      "n_chunks": 15,
+      "n_questions": 8,
+      "token_accuracy": 0.9166666666666666,
+      "correct_tokens": 11,
+      "total_tokens": 12,
+      "exact_match_questions": 3
+    },
+    {
+      "title": "Hannah Dodd",
+      "n_chunks": 9,
+      "n_questions": 8,
+      "token_accuracy": 0.9090909090909091,
+      "correct_tokens": 20,
+      "total_tokens": 22,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "Dvorak technique",
+      "n_chunks": 20,
+      "n_questions": 6,
+      "token_accuracy": 1.0,
+      "correct_tokens": 24,
+      "total_tokens": 24,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Temple Beth Israel ( Eugene , Oregon )",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 0.9565217391304348,
+      "correct_tokens": 22,
+      "total_tokens": 23,
+      "exact_match_questions": 6
+    },
+    {
+      "title": "Military history of Gibraltar during World War II",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 11,
+      "total_tokens": 11,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "Kiss You ( One Direction song )",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 19,
+      "total_tokens": 19,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "Constant k filter",
+      "n_chunks": 11,
+      "n_questions": 1,
+      "token_accuracy": 1.0,
+      "correct_tokens": 4,
+      "total_tokens": 4,
+      "exact_match_questions": 1
+    },
+    {
+      "title": "Christopher Gore",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 30,
+      "total_tokens": 30,
+      "exact_match_questions": 7
+    },
+    {
+      "title": "1933 Treasure Coast hurricane",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 12,
+      "total_tokens": 12,
+      "exact_match_questions": 4
+    },
+    {
+      "title": "Brad Stevens",
+      "n_chunks": 20,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 20,
+      "total_tokens": 20,
+      "exact_match_questions": 5
+    },
+    {
+      "title": "Typhoon Krosa ( 2013 )",
+      "n_chunks": 10,
+      "n_questions": 8,
+      "token_accuracy": 1.0,
+      "correct_tokens": 18,
+      "total_tokens": 18,
+      "exact_match_questions": 6
+    }
+  ],
+  "config": {
+    "model_name": "Qwen/Qwen2.5-1.5B",
+    "memory_mode": "cross_attn",
+    "n_slots": 64,
+    "lora_rank": 16,
+    "lora_targets": "q_proj,v_proj",
+    "n_extract": 1,
+    "load_checkpoint": "results/checkpoints/natural_15ep.pt",
+    "n_articles": 50,
+    "n_questions": 8,
+    "max_chunks": 20,
+    "chunk_size": 128,
+    "seed": 42,
+    "device": "cuda",
+    "output_dir": "results/exp_v3_3_streaming_diverse",
+    "no_memory": false
+  }
+}
