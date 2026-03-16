@@ -33,12 +33,14 @@ class MemoryBank(nn.Module):
         gate_bias: float = -2.0,
         decay: float = 0.999,
         n_extract: int = 1,
+        eviction: str = "circular",
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.n_slots = n_slots
         self.decay = decay
         self.n_extract = n_extract
+        self.eviction = eviction  # "circular" or "importance"
 
         # Write gate
         self.W_gate = nn.Linear(hidden_size, 1, bias=True)
@@ -63,6 +65,16 @@ class MemoryBank(nn.Module):
         self.mem_states.zero_()
         self.mem_strength.zero_()
         self.write_ptr.zero_()
+
+    def _get_write_slot(self, write_ptr, mem_strength, param_dtype):
+        """Get the slot index to write to based on eviction strategy."""
+        if self.eviction == "importance" and write_ptr >= self.n_slots:
+            # Buffer full — evict the slot with lowest strength
+            slot_idx = mem_strength.argmin()
+        else:
+            # Circular or buffer not yet full
+            slot_idx = write_ptr % self.n_slots
+        return slot_idx
 
     def write(self, hidden_states: torch.Tensor):
         """Store gated hidden states.
@@ -107,7 +119,7 @@ class MemoryBank(nn.Module):
 
             # Write k slots
             for ei in range(self.n_extract):
-                slot_idx = write_ptr % self.n_slots
+                slot_idx = self._get_write_slot(write_ptr, mem_strength, param_dtype)
                 mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
                 mask_2d = mask.unsqueeze(1)
                 mem_states = mem_states * (1 - mask_2d) + mask_2d * extracted[ei].unsqueeze(0)
@@ -118,7 +130,7 @@ class MemoryBank(nn.Module):
             w_sum = weights.sum(dim=(0, 1)).clamp(min=1e-8)
             aggregated = (x * weights.unsqueeze(-1)).sum(dim=(0, 1)) / w_sum  # (hidden_size,)
 
-            slot_idx = write_ptr % self.n_slots
+            slot_idx = self._get_write_slot(write_ptr, mem_strength, param_dtype)
             mask = F.one_hot(slot_idx, self.n_slots).to(dtype=param_dtype)
             mask_2d = mask.unsqueeze(1)
             mem_states = mem_states * (1 - mask_2d) + mask_2d * aggregated.unsqueeze(0)
