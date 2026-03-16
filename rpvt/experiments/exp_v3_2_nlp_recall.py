@@ -1195,6 +1195,14 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="results/exp_v3_2")
 
+    # Checkpointing
+    parser.add_argument("--save-checkpoint", type=str, default=None,
+                        help="Save trained LoRA + memory weights to this path after training")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Load trained weights and skip training (eval only)")
+    parser.add_argument("--eval-data-source", type=str, default=None,
+                        help="Evaluate on a different data source than training (generalization test)")
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1238,6 +1246,40 @@ def main():
         data_source=args.data_source,
     )
 
+    # Load checkpoint if provided (skip training)
+    if args.load_checkpoint:
+        print(f"\nLoading checkpoint from {args.load_checkpoint}...")
+        checkpoint = torch.load(args.load_checkpoint, map_location=args.device, weights_only=True)
+        # Load trainable params
+        model_state = model.state_dict()
+        loaded = 0
+        for name, param in checkpoint.items():
+            if name in model_state:
+                model_state[name].copy_(param)
+                loaded += 1
+        print(f"  Loaded {loaded} parameter tensors")
+
+        # Build eval dataset (possibly different from training format)
+        eval_source = args.eval_data_source or args.data_source
+        if eval_source != args.data_source:
+            print(f"\n=== Cross-format eval: trained on '{args.data_source}', evaluating on '{eval_source}' ===")
+            eval_data = SQuADRecallDataset(
+                tokenizer=tokenizer, split="validation",
+                n_docs=args.n_eval, chunk_size=args.chunk_size,
+                gap_range=(args.gap_min, args.gap_max),
+                max_qa_pairs=args.max_qa_pairs, seed=args.seed + 1000,
+                data_source=eval_source,
+            )
+
+        results = evaluate(model, eval_data, device=args.device, verbose=True)
+        results["config"] = vars(args)
+        results["checkpoint"] = args.load_checkpoint
+
+        with open(Path(args.output_dir) / "results.json", "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\nResults saved to {args.output_dir}/")
+        return
+
     # Run no-memory baseline first
     if not args.no_memory:
         print(f"\n=== No-memory baseline (LoRA only, per-chunk) ===")
@@ -1256,6 +1298,27 @@ def main():
         output_dir=args.output_dir,
         retrieval_loss_weight=args.retrieval_loss_weight,
     )
+
+    # Save checkpoint if requested
+    if args.save_checkpoint:
+        trainable_state = {
+            name: param.data.clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+        # Also save memory bank buffers
+        from rpvt.model.cross_attention_memory import MemoryBank
+        for name, module in model.named_modules():
+            if isinstance(module, MemoryBank):
+                for buf_name, buf in module.named_buffers():
+                    full_name = f"{name}.{buf_name}" if name else buf_name
+                    trainable_state[full_name] = buf.data.clone()
+
+        save_path = args.save_checkpoint
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        torch.save(trainable_state, save_path)
+        n_params = sum(p.numel() for p in trainable_state.values())
+        print(f"\nCheckpoint saved to {save_path} ({n_params:,} params)")
 
     results["config"] = vars(args)
 
