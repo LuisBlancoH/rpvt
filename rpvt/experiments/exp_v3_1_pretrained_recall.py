@@ -247,7 +247,7 @@ def make_chunk_local_mask(seq_len, chunk_size, device):
 def build_model(model_name, device, memory_layer, memory_size, n_slots,
                 decay, gate_bias, lora_rank, lora_targets, no_memory=False,
                 no_lora=False, init_qk_shared=False, n_extract=1,
-                memory_mode="additive"):
+                memory_mode="additive", lora_layers=None, mem_proj=False):
     """Load pretrained model, attach LoRA and Hopfield memory.
 
     Args:
@@ -277,16 +277,21 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
     # Apply LoRA
     if not no_lora:
         targets = [t.strip() for t in lora_targets.split(",")]
-        lora_config = LoraConfig(
+        lora_kwargs = dict(
             task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_rank * 2,
             lora_dropout=0.05,
             target_modules=targets,
         )
+        # Optional: restrict LoRA to specific layers
+        if lora_layers is not None:
+            lora_kwargs["layers_to_transform"] = lora_layers
+        lora_config = LoraConfig(**lora_kwargs)
         model = get_peft_model(model, lora_config)
         n_lora = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  LoRA: rank={lora_rank}, targets={targets}, params={n_lora:,}")
+        layers_info = f", layers={lora_layers}" if lora_layers else ""
+        print(f"  LoRA: rank={lora_rank}, targets={targets}{layers_info}, params={n_lora:,}")
     else:
         print("  No LoRA (memory only)")
 
@@ -296,10 +301,13 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
             memory_layer = n_layers // 2  # default: middle layer
 
         # Get the layers list — handle peft wrapping
-        if hasattr(model, 'base_model'):
-            layers = model.base_model.model.model.layers
-        else:
+        if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+            base = model.base_model.model
+            layers = base.model.layers if hasattr(base, 'model') else base.layers
+        elif hasattr(model, 'model'):
             layers = model.model.layers
+        else:
+            layers = model.layers
 
         if memory_mode == "cross_attn":
             from rpvt.model.cross_attention_memory import (
@@ -337,11 +345,18 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
             else:
                 raise ValueError(f"Can't find self_attn in layer {read_layer}")
 
-            aug_attn = MemoryAugmentedAttention(original_attn, bank)
+            aug_attn = MemoryAugmentedAttention(original_attn, bank, mem_proj=mem_proj)
+            if mem_proj:
+                aug_attn = aug_attn.to(device=device, dtype=torch.bfloat16)
             read_layer_module.self_attn = aug_attn
 
             n_mem = sum(p.numel() for p in bank.parameters())
-            print(f"  Memory params: {n_mem:,}")
+            if mem_proj and aug_attn.mem_proj is not None:
+                n_proj = sum(p.numel() for p in aug_attn.mem_proj.parameters())
+                n_mem += n_proj
+                print(f"  Memory params: {n_mem:,} (gate={n_mem - n_proj:,}, proj={n_proj:,})")
+            else:
+                print(f"  Memory params: {n_mem:,}")
 
         else:
             # Original additive mode

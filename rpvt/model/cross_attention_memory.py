@@ -234,11 +234,25 @@ class MemoryAugmentedAttention(nn.Module):
     standard q_proj/k_proj/v_proj/o_proj attention layers.
     """
 
-    def __init__(self, original_attn, memory_bank: MemoryBank):
+    def __init__(self, original_attn, memory_bank: MemoryBank, mem_proj=False):
         super().__init__()
         self.attn = original_attn
         self.memory_bank = memory_bank
         self._rope_fn, self._attn_fn = _get_rotary_and_attention_fns(original_attn)
+
+        # Optional: dedicated memory projection (for instruct models where
+        # k_proj/v_proj can't be adapted via LoRA without breaking generation)
+        self.mem_proj = None
+        if mem_proj:
+            hidden_size = memory_bank.hidden_size
+            self.mem_proj = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size, bias=False),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size, bias=False),
+            )
+            # Initialize close to identity
+            nn.init.eye_(self.mem_proj[0].weight)
+            nn.init.eye_(self.mem_proj[2].weight)
 
     def __getattr__(self, name):
         try:
@@ -276,6 +290,11 @@ class MemoryAugmentedAttention(nn.Module):
         mem_states, n_active = self.memory_bank.get_active_memories()
         if n_active > 0:
             mem_hidden = mem_states.unsqueeze(0).to(dtype=hidden_states.dtype)  # (1, n_mem, hidden)
+
+            # Apply memory projection if available (for instruct models)
+            if self.mem_proj is not None:
+                mem_hidden = self.mem_proj(mem_hidden)
+
             head_dim = self.attn.head_dim
             # Derive n_kv_heads from k_proj output size
             kv_dim = self.attn.k_proj.out_features
