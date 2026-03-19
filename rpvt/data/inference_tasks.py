@@ -177,12 +177,113 @@ def generate_aggregation_task(rng):
     return passages, [qa]
 
 
+def generate_derivation_task(rng):
+    """Answer requires computing/deriving from stored facts.
+
+    Example:
+        Memory 1: "The access level is determined by years of service times 3."
+        Memory 2: "Agent Rivera has 8 years of service."
+        Question: "What is Agent Rivera's access level?"
+        Answer: "24"
+    """
+    templates = [
+        # Code from computation
+        {
+            "facts": [
+                "{name}'s employee ID is {id1}.",
+                "The security code is the employee ID plus {offset}.",
+            ],
+            "question": "What is {name}'s security code?",
+            "compute": lambda v: str(v["id1"] + v["offset"]),
+            "gen_vars": lambda rng: {
+                "name": rng.choice(["Agent Rivera", "Dr. Chen", "Officer Malik", "Captain Torres"]),
+                "id1": rng.randint(1000, 9999),
+                "offset": rng.choice([100, 200, 500, 1000]),
+            },
+        },
+        # Access from years × multiplier
+        {
+            "facts": [
+                "{name} has {years} years of service in the department.",
+                "Access level is calculated as years of service times {mult}.",
+            ],
+            "question": "What is {name}'s access level?",
+            "compute": lambda v: str(v["years"] * v["mult"]),
+            "gen_vars": lambda rng: {
+                "name": rng.choice(["Agent Kim", "Director Walsh", "Analyst Petrov", "Sergeant Okafor"]),
+                "years": rng.randint(2, 15),
+                "mult": rng.choice([3, 5, 10]),
+            },
+        },
+        # Combined passcode
+        {
+            "facts": [
+                "{name1}'s code fragment is {frag1}.",
+                "{name2}'s code fragment is {frag2}.",
+                "The full passcode is {name1}'s fragment followed by {name2}'s fragment.",
+            ],
+            "question": "What is the full passcode?",
+            "compute": lambda v: f"{v['frag1']}{v['frag2']}",
+            "gen_vars": lambda rng: {
+                "name1": rng.choice(["Alice", "Bob", "Carol"]),
+                "name2": rng.choice(["David", "Elena", "Frank"]),
+                "frag1": str(rng.randint(100, 999)),
+                "frag2": str(rng.randint(100, 999)),
+            },
+        },
+        # Conditional access
+        {
+            "facts": [
+                "The project name is {project}.",
+                "Only personnel who know the project name can access the vault.",
+                "The vault contains document {doc_id}.",
+            ],
+            "question": "What document is in the vault for project {project}?",
+            "compute": lambda v: v["doc_id"],
+            "gen_vars": lambda rng: {
+                "project": rng.choice(["AURORA", "SENTINEL", "NEXUS", "PHANTOM", "ECLIPSE"]),
+                "doc_id": f"DOC-{rng.randint(1000, 9999)}",
+            },
+        },
+        # Difference
+        {
+            "facts": [
+                "Building A has {floors_a} floors.",
+                "Building B has {floors_b} floors.",
+                "The connector bridge is on the floor equal to the difference in height.",
+            ],
+            "question": "What floor is the connector bridge on?",
+            "compute": lambda v: str(abs(v["floors_a"] - v["floors_b"])),
+            "gen_vars": lambda rng: {
+                "floors_a": rng.randint(10, 50),
+                "floors_b": rng.randint(10, 50),
+            },
+        },
+    ]
+
+    template = rng.choice(templates)
+    variables = template["gen_vars"](rng)
+
+    passages = [fact.format(**variables) for fact in template["facts"]]
+    answer = template["compute"](variables)
+
+    qa = {
+        "question": template["question"].format(**variables),
+        "answer": answer,
+        "type": "derivation",
+        "reasoning": f"computed from: {variables}",
+    }
+
+    return passages, [qa]
+
+
 TASK_GENERATORS = {
     "multihop": generate_multihop_task,
     "comparison": generate_comparison_task,
     "constraint": generate_constraint_task,
     "temporal": generate_temporal_task,
     "aggregation": generate_aggregation_task,
+    "derivation": generate_derivation_task,
 }
 
 
