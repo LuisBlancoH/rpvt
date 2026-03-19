@@ -42,10 +42,32 @@ from rpvt.experiments.exp_v3_2_nlp_recall import (
 )
 
 
+def _make_qa_chunk(tokenizer, question, answer, chunk_size):
+    """Helper: create a chat-formatted QA chunk with answer mask."""
+    messages = [{"role": "user", "content": question}]
+    chat_prefix = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    full_text = chat_prefix + answer + "<|im_end|>"
+    full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+    prefix_len = len(tokenizer.encode(chat_prefix, add_special_tokens=False))
+
+    answer_mask = torch.zeros(chunk_size, dtype=torch.float32)
+    for pos in range(max(0, prefix_len - 1), min(len(full_tokens) - 1, chunk_size)):
+        answer_mask[pos] = 1.0
+
+    if len(full_tokens) >= chunk_size:
+        full_tokens = full_tokens[:chunk_size]
+    else:
+        full_tokens = full_tokens + [tokenizer.eos_token_id or 0] * (chunk_size - len(full_tokens))
+
+    return torch.tensor(full_tokens, dtype=torch.long), answer_mask
+
+
 def build_dataset(tokenizer, n_memory=500, n_instruct=10000,
                   mem_chunk_size=128, inst_max_len=512,
                   gap_range=(2, 6), max_qa_pairs=3, seed=42):
-    """Build mixed dataset with proper-length instruct examples."""
+    """Build mixed dataset: memory recall + instruct + abstention + adversarial."""
     rng = random.Random(seed)
 
     # === Memory docs (128-token chunks, same as always) ===
@@ -83,27 +105,97 @@ def build_dataset(tokenizer, n_memory=500, n_instruct=10000,
 
         # QA chunk with chat template
         for qa in qa_pairs:
-            messages = [{"role": "user", "content": qa["question"]}]
-            chat_prefix = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            qa_chunk, answer_mask = _make_qa_chunk(
+                tokenizer, qa["question"], qa["answer"], mem_chunk_size
             )
-            full_text = chat_prefix + qa["answer"] + "<|im_end|>"
-            full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
-            prefix_len = len(tokenizer.encode(chat_prefix, add_special_tokens=False))
-
-            answer_mask = torch.zeros(mem_chunk_size, dtype=torch.float32)
-            for pos in range(max(0, prefix_len - 1), min(len(full_tokens) - 1, mem_chunk_size)):
-                answer_mask[pos] = 1.0
-
-            if len(full_tokens) >= mem_chunk_size:
-                full_tokens = full_tokens[:mem_chunk_size]
-            else:
-                full_tokens = full_tokens + [tokenizer.eos_token_id or 0] * (mem_chunk_size - len(full_tokens))
-
-            qa_chunk = torch.tensor(full_tokens, dtype=torch.long)
             memory_docs.append({
                 "type": "memory",
                 "chunks": passage_chunks + filler_chunks + [qa_chunk],
+                "answer_mask": answer_mask,
+                "seq_len": mem_chunk_size,
+            })
+
+    # === Abstention docs: question WITHOUT passage in memory ===
+    # Teaches model to say "I don't know" when memory has no evidence
+    n_abstention = int(n_memory * 0.3)
+    print(f"  Generating {n_abstention} abstention docs...")
+    abstention_facts = _generate_natural_facts(rng, n_abstention, max_qa_pairs=2)
+
+    abstention_responses = [
+        "I don't have that information stored in my memory.",
+        "I don't have information about that.",
+        "I'm not sure, I don't have that in my memory.",
+        "I don't have enough information to answer that.",
+        "That information isn't in my memory.",
+    ]
+
+    abstention_docs = []
+    for passage, qa_pairs in abstention_facts:
+        gap = rng.randint(gap_range[0], gap_range[1])
+        # ONLY filler chunks — NO passage. Memory will be empty of relevant facts.
+        only_filler = []
+        for _ in range(gap + 2):
+            ft = rng.choice(filler_texts)
+            ft_tok = tokenizer.encode(ft, add_special_tokens=False)
+            if len(ft_tok) >= mem_chunk_size:
+                start = rng.randint(0, len(ft_tok) - mem_chunk_size)
+                ct = ft_tok[start:start + mem_chunk_size]
+            else:
+                ct = ft_tok + [tokenizer.eos_token_id or 0] * (mem_chunk_size - len(ft_tok))
+            only_filler.append(torch.tensor(ct, dtype=torch.long))
+
+        for qa in qa_pairs:
+            # Same question, but answer is abstention
+            abstention_answer = rng.choice(abstention_responses)
+            qa_chunk, answer_mask = _make_qa_chunk(
+                tokenizer, qa["question"], abstention_answer, mem_chunk_size
+            )
+            abstention_docs.append({
+                "type": "abstention",
+                "chunks": only_filler + [qa_chunk],
+                "answer_mask": answer_mask,
+                "seq_len": mem_chunk_size,
+            })
+
+    # === Adversarial docs: related but WRONG information in memory ===
+    # Teaches model not to confuse similar entities
+    n_adversarial = int(n_memory * 0.15)
+    print(f"  Generating {n_adversarial} adversarial docs...")
+    adversarial_facts_a = _generate_natural_facts(rng, n_adversarial, max_qa_pairs=2)
+    adversarial_facts_b = _generate_natural_facts(rng, n_adversarial, max_qa_pairs=2)
+
+    adversarial_docs = []
+    for (passage_a, qa_a), (passage_b, qa_b) in zip(adversarial_facts_a, adversarial_facts_b):
+        gap = rng.randint(gap_range[0], gap_range[1])
+        # Store passage A in memory
+        pa_tokens = tokenizer.encode(passage_a, add_special_tokens=False)
+        pa_chunks = []
+        for i in range(0, len(pa_tokens), mem_chunk_size):
+            ct = pa_tokens[i:i + mem_chunk_size]
+            if len(ct) < mem_chunk_size:
+                ct = ct + [tokenizer.eos_token_id or 0] * (mem_chunk_size - len(ct))
+            pa_chunks.append(torch.tensor(ct, dtype=torch.long))
+
+        adv_filler = []
+        for _ in range(gap):
+            ft = rng.choice(filler_texts)
+            ft_tok = tokenizer.encode(ft, add_special_tokens=False)
+            if len(ft_tok) >= mem_chunk_size:
+                start = rng.randint(0, len(ft_tok) - mem_chunk_size)
+                ct = ft_tok[start:start + mem_chunk_size]
+            else:
+                ct = ft_tok + [tokenizer.eos_token_id or 0] * (mem_chunk_size - len(ft_tok))
+            adv_filler.append(torch.tensor(ct, dtype=torch.long))
+
+        # Ask about person B (not stored!) — model should abstain
+        for qa in qa_b[:1]:
+            abstention_answer = rng.choice(abstention_responses)
+            qa_chunk, answer_mask = _make_qa_chunk(
+                tokenizer, qa["question"], abstention_answer, mem_chunk_size
+            )
+            adversarial_docs.append({
+                "type": "adversarial",
+                "chunks": pa_chunks + adv_filler + [qa_chunk],
                 "answer_mask": answer_mask,
                 "seq_len": mem_chunk_size,
             })
@@ -155,14 +247,15 @@ def build_dataset(tokenizer, n_memory=500, n_instruct=10000,
             "seq_len": seq_len,
         })
 
-    all_docs = memory_docs + instruct_docs
+    all_docs = memory_docs + abstention_docs + adversarial_docs + instruct_docs
     rng.shuffle(all_docs)
 
-    n_mem = sum(1 for d in all_docs if d["type"] == "memory")
-    n_inst = sum(1 for d in all_docs if d["type"] == "instruct")
-    avg_inst_len = sum(d["seq_len"] for d in all_docs if d["type"] == "instruct") / max(n_inst, 1)
-    print(f"  Dataset: {len(all_docs)} docs ({n_mem} memory, {n_inst} instruct, "
-          f"avg instruct len={avg_inst_len:.0f} tokens)")
+    type_counts = {}
+    for d in all_docs:
+        type_counts[d["type"]] = type_counts.get(d["type"], 0) + 1
+    avg_inst_len = sum(d["seq_len"] for d in all_docs if d["type"] == "instruct") / max(type_counts.get("instruct", 1), 1)
+    print(f"  Dataset: {len(all_docs)} docs — {type_counts}, "
+          f"avg instruct len={avg_inst_len:.0f} tokens")
     return all_docs
 
 
@@ -215,7 +308,7 @@ def train(model, tokenizer, train_docs, eval_docs, device,
         for doc_idx in order:
             doc = train_docs[doc_idx]
             chunks = doc["chunks"]
-            is_memory = doc["type"] == "memory"
+            is_memory = doc["type"] in ("memory", "abstention", "adversarial")
 
             if is_memory:
                 reset_memories(model)
@@ -257,7 +350,10 @@ def train(model, tokenizer, train_docs, eval_docs, device,
                 detach_memory_state(model)
                 set_persistent_grad(model, False)
 
-            losses[doc["type"]].append(doc_loss.item())
+            loss_type = "memory" if doc["type"] in ("memory", "abstention", "adversarial") else "instruct"
+            if loss_type not in losses:
+                losses[loss_type] = []
+            losses[loss_type].append(doc_loss.item())
             global_step += 1
 
             if global_step % log_every == 0:
@@ -293,7 +389,7 @@ def evaluate(model, tokenizer, eval_docs, device):
     with torch.no_grad():
         for doc in eval_docs:
             chunks = doc["chunks"]
-            is_memory = doc["type"] == "memory"
+            is_memory = doc["type"] in ("memory", "abstention", "adversarial")
 
             if is_memory:
                 reset_memories(model)
@@ -399,8 +495,28 @@ def test_generation(model, tokenizer, device):
         print(f"  A: {resp[:200]}")
         print()
 
-    # Test 3: Longer generation
-    print("3. Longer generation:")
+    # Test 3: Abstention (should say "I don't know")
+    print("3. Abstention (no relevant memory):")
+    reset_memories(model)
+    # Store irrelevant info, ask about something else
+    process_chunk("The weather in Tokyo was sunny yesterday. Cherry blossoms are blooming in April.")
+    for _ in range(3):
+        process_chunk(filler)
+    resp = generate_chat("What is the operation code from the classified briefing?")
+    print(f"  Stored: weather info (irrelevant)")
+    print(f"  Q: What is the operation code from the classified briefing?")
+    print(f"  A: {resp[:200]}")
+    print()
+
+    # No memory at all
+    reset_memories(model)
+    resp = generate_chat("What was Dr. Stellion's budget?")
+    print(f"  Q: What was Dr. Stellion's budget? (empty memory)")
+    print(f"  A: {resp[:200]}")
+    print()
+
+    # Test 4: Longer generation
+    print("4. Longer generation:")
     reset_memories(model)
     resp = generate_chat("Write a short paragraph about the importance of sleep.")
     print(f"  Q: Write a short paragraph about the importance of sleep.")
