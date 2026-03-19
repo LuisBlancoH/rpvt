@@ -1,0 +1,21 @@
+{
+  "memory_token_acc": 0.7952755905511811,
+  "memory_correct": 505,
+  "memory_total": 635,
+  "instruct_loss": 0.36708491522993425,
+  "config": {
+    "model_name": "Qwen/Qwen2.5-1.5B",
+    "lora_rank": 32,
+    "epochs": 15,
+    "n_memory": 500,
+    "n_instruct": 1000,
+    "n_eval_memory": 50,
+    "n_eval_instruct": 50,
+    "lr_lora": 0.0002,
+    "log_every": 50,
+    "seed": 42,
+    "device": "cuda",
+    "output_dir": "results/exp_v3_5_joint_v2",
+    "save_checkpoint": "results/checkpoints/joint_v2_15ep.pt"
+  }
+}

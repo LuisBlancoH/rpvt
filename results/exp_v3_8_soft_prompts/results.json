@@ -1,0 +1,19 @@
+{
+  "token_acc": 0.3314917127071823,
+  "correct": 240,
+  "total": 724,
+  "config": {
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "epochs": 15,
+    "n_memory": 500,
+    "n_eval": 50,
+    "n_prompts": 8,
+    "inner_dim": 512,
+    "lr": 0.001,
+    "log_every": 100,
+    "seed": 42,
+    "device": "cuda",
+    "output_dir": "results/exp_v3_8_soft_prompts",
+    "save_checkpoint": "results/checkpoints/soft_prompts_15ep.pt"
+  }
+}

@@ -337,3 +337,229 @@ class MemoryAugmentedAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.attn.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class SoftPromptMemoryReader(nn.Module):
+    """Converts memory bank contents into soft prompt embeddings.
+
+    Instead of injecting memory into the residual stream (which frozen
+    models ignore) or modifying attention (which requires LoRA), this
+    module generates a few embedding vectors from memory that get
+    PREPENDED to the input. The model processes them through its
+    normal forward pass — using its pretrained attention to decide
+    what's relevant.
+
+    Memory bank → cross-attention → MLP → n_prompt embeddings
+    These embeddings are in the model's embedding space, so the model
+    treats them like normal context tokens.
+
+    Args:
+        hidden_size: model hidden dimension
+        memory_bank: MemoryBank instance to read from
+        n_prompts: number of soft prompt tokens to generate
+        inner_dim: cross-attention inner dimension
+        n_heads: number of attention heads
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        memory_bank: MemoryBank,
+        n_prompts: int = 8,
+        inner_dim: int = 512,
+        n_heads: int = 8,
+    ):
+        super().__init__()
+        self.memory_bank = memory_bank
+        self.hidden_size = hidden_size
+        self.n_prompts = n_prompts
+        self.inner_dim = inner_dim
+        self.n_heads = n_heads
+        self.head_dim = inner_dim // n_heads
+
+        # Learned queries — one per soft prompt token
+        self.prompt_queries = nn.Parameter(
+            torch.randn(n_prompts, hidden_size) * 0.02
+        )
+
+        # Cross-attention: queries attend to memory
+        self.q_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+
+        # Project back to hidden_size and refine
+        self.out_proj = nn.Sequential(
+            nn.Linear(inner_dim, hidden_size, bias=False),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=False),
+        )
+
+        # Layer norm
+        self.ln = nn.LayerNorm(hidden_size)
+
+        # Initialize
+        nn.init.normal_(self.q_proj.weight, std=0.02)
+        nn.init.normal_(self.k_proj.weight, std=0.02)
+        nn.init.normal_(self.v_proj.weight, std=0.02)
+        nn.init.normal_(self.out_proj[0].weight, std=0.02)
+        nn.init.normal_(self.out_proj[2].weight, std=0.01)
+
+    def forward(self):
+        """Generate soft prompt embeddings from memory.
+
+        Returns:
+            soft_prompts: (1, n_prompts, hidden_size) or None if no memories
+        """
+        mem_states, n_active = self.memory_bank.get_active_memories()
+        if n_active == 0:
+            return None
+
+        mem = mem_states.to(dtype=self.prompt_queries.dtype)  # (n_mem, hidden)
+
+        # Queries from learned prompt embeddings
+        q = self.q_proj(self.prompt_queries)  # (n_prompts, inner_dim)
+        q = q.view(self.n_prompts, self.n_heads, self.head_dim)
+
+        # Keys/Values from memory
+        k = self.k_proj(mem)  # (n_mem, inner_dim)
+        v = self.v_proj(mem)
+        k = k.view(n_active, self.n_heads, self.head_dim)
+        v = v.view(n_active, self.n_heads, self.head_dim)
+
+        # Cross-attention: each prompt query attends to all memory slots
+        scale = self.head_dim ** -0.5
+        # (n_heads, n_prompts, n_mem)
+        attn_weights = torch.einsum('pnh,mnh->npm', q, k) * scale
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        # (n_heads, n_prompts, head_dim)
+        attn_out = torch.einsum('npm,mnh->pnh', attn_weights, v)
+        attn_out = attn_out.reshape(self.n_prompts, self.inner_dim)
+
+        # Project and refine
+        prompts = self.out_proj(attn_out)
+        prompts = self.ln(prompts + self.prompt_queries)  # residual connection
+
+        return prompts.unsqueeze(0)  # (1, n_prompts, hidden_size)
+
+
+class ParallelCrossAttention(nn.Module):
+    """Separate cross-attention module that reads from memory.
+
+    Unlike MemoryAugmentedAttention which modifies the existing self-attention,
+    this module is completely independent — it has its own Q/K/V/O projections
+    and a learned gate. The existing self-attention stays untouched.
+
+    This decouples memory reading from the model's generation distribution:
+    - Gate starts at 0 → model behaves as pure instruct initially
+    - Only the new module's weights are trained
+    - No LoRA needed → instruct distribution perfectly preserved
+
+    Architecture:
+        residual = layer_output + gate * cross_attn(layer_output, memory)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        memory_bank: MemoryBank,
+        inner_dim: int = 256,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.memory_bank = memory_bank
+        self.hidden_size = hidden_size
+        self.inner_dim = inner_dim
+        self.n_heads = n_heads
+        self.head_dim = inner_dim // n_heads
+
+        # Cross-attention projections
+        self.q_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, inner_dim, bias=False)
+        self.o_proj = nn.Linear(inner_dim, hidden_size, bias=False)
+
+        # No learnable gate — o_proj initialized small controls the scale
+        # A learnable gate tends to collapse to 0 during training
+
+        # Layer norm for cross-attention input
+        self.ln = nn.LayerNorm(hidden_size)
+
+        # Initialize small — gate controls perturbation magnitude
+        nn.init.normal_(self.q_proj.weight, std=0.02)
+        nn.init.normal_(self.k_proj.weight, std=0.02)
+        nn.init.normal_(self.v_proj.weight, std=0.02)
+        nn.init.normal_(self.o_proj.weight, std=0.01)  # small but nonzero for gradient flow
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Cross-attend to memory and return gated output to add to residual.
+
+        Args:
+            hidden_states: (batch, seq_len, hidden_size) — output from the layer
+
+        Returns:
+            (batch, seq_len, hidden_size) — gated cross-attention output
+        """
+        mem_states, n_active = self.memory_bank.get_active_memories()
+        if n_active == 0:
+            return torch.zeros_like(hidden_states)
+
+        bsz, seq_len, _ = hidden_states.shape
+        x = self.ln(hidden_states)
+
+        # Query from current hidden states
+        q = self.q_proj(x)  # (bsz, seq_len, inner_dim)
+        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        # (bsz, n_heads, seq_len, head_dim)
+
+        # Key/Value from memory
+        mem = mem_states.unsqueeze(0).to(dtype=x.dtype)  # (1, n_mem, hidden)
+        k = self.k_proj(mem)  # (1, n_mem, inner_dim)
+        v = self.v_proj(mem)  # (1, n_mem, inner_dim)
+        k = k.view(1, n_active, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(1, n_active, self.n_heads, self.head_dim).transpose(1, 2)
+        # (1, n_heads, n_mem, head_dim)
+
+        # Expand for batch
+        k = k.expand(bsz, -1, -1, -1)
+        v = v.expand(bsz, -1, -1, -1)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)
+        # (bsz, n_heads, seq_len, head_dim)
+
+        # Merge heads and project
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.inner_dim)
+        output = self.o_proj(attn_out)
+
+        return output
+
+
+class ParallelCrossAttentionWrapper(nn.Module):
+    """Wraps a transformer layer — adds parallel cross-attention after normal forward.
+
+    The original layer runs unchanged, then the cross-attention module
+    reads from memory and adds its gated output to the residual stream.
+    """
+
+    def __init__(self, original_layer, cross_attn: ParallelCrossAttention):
+        super().__init__()
+        self.layer = original_layer
+        self.cross_attn = cross_attn
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.layer, name)
+
+    def forward(self, *args, **kwargs):
+        outputs = self.layer(*args, **kwargs)
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+        memory_output = self.cross_attn(hidden_states)
+        if isinstance(outputs, tuple):
+            return (hidden_states + memory_output,) + outputs[1:]
+        return hidden_states + memory_output

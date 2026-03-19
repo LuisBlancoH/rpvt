@@ -309,9 +309,10 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
         else:
             layers = model.layers
 
-        if memory_mode == "cross_attn":
+        if memory_mode in ("cross_attn", "parallel_cross_attn"):
             from rpvt.model.cross_attention_memory import (
                 MemoryBank, WriteWrapper, MemoryAugmentedAttention,
+                ParallelCrossAttention, ParallelCrossAttentionWrapper,
             )
 
             read_layer = memory_layer + 1
@@ -345,18 +346,35 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
             else:
                 raise ValueError(f"Can't find self_attn in layer {read_layer}")
 
-            aug_attn = MemoryAugmentedAttention(original_attn, bank, mem_proj=mem_proj)
-            if mem_proj:
-                aug_attn = aug_attn.to(device=device, dtype=torch.bfloat16)
-            read_layer_module.self_attn = aug_attn
+            if memory_mode == "cross_attn":
+                aug_attn = MemoryAugmentedAttention(original_attn, bank, mem_proj=mem_proj)
+                if mem_proj:
+                    aug_attn = aug_attn.to(device=device, dtype=torch.bfloat16)
+                read_layer_module.self_attn = aug_attn
 
-            n_mem = sum(p.numel() for p in bank.parameters())
-            if mem_proj and aug_attn.mem_proj is not None:
-                n_proj = sum(p.numel() for p in aug_attn.mem_proj.parameters())
-                n_mem += n_proj
-                print(f"  Memory params: {n_mem:,} (gate={n_mem - n_proj:,}, proj={n_proj:,})")
-            else:
-                print(f"  Memory params: {n_mem:,}")
+                n_mem = sum(p.numel() for p in bank.parameters())
+                if mem_proj and aug_attn.mem_proj is not None:
+                    n_proj = sum(p.numel() for p in aug_attn.mem_proj.parameters())
+                    n_mem += n_proj
+                    print(f"  Memory params: {n_mem:,} (gate={n_mem - n_proj:,}, proj={n_proj:,})")
+                else:
+                    print(f"  Memory params: {n_mem:,}")
+            elif memory_mode == "parallel_cross_attn":
+                # Parallel cross-attention: completely separate module, no LoRA needed
+                cross_attn = ParallelCrossAttention(
+                    hidden_size=hidden_size,
+                    memory_bank=bank,
+                    inner_dim=hidden_size,  # full hidden size for max capacity
+                    n_heads=12,
+                ).to(device=device, dtype=torch.bfloat16)
+
+                wrapped_read = ParallelCrossAttentionWrapper(layers[read_layer], cross_attn)
+                layers[read_layer] = wrapped_read
+
+                n_bank = sum(p.numel() for p in bank.parameters())
+                n_cross = sum(p.numel() for p in cross_attn.parameters()) - sum(p.numel() for p in bank.parameters())
+                n_mem = n_bank + n_cross
+                print(f"  Memory params: {n_mem:,} (bank={n_bank:,}, cross_attn={n_cross:,})")
 
         else:
             # Original additive mode
@@ -394,9 +412,10 @@ def build_model(model_name, device, memory_layer, memory_size, n_slots,
 
 def get_memory_params(model):
     """Get parameter names belonging to memory modules (NOT the wrapped layer)."""
+    from rpvt.model.cross_attention_memory import MemoryBank
     memory_param_names = set()
     for name, module in model.named_modules():
-        if isinstance(module, HopfieldMemory):
+        if isinstance(module, (HopfieldMemory, MemoryBank)):
             for pname, _ in module.named_parameters():
                 full_name = f"{name}.{pname}"
                 memory_param_names.add(full_name)

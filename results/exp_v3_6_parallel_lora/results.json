@@ -1,0 +1,35 @@
+{
+  "memory_token_acc": 0.7596685082872928,
+  "memory_correct": 550,
+  "memory_total": 724,
+  "instruct_loss": 0.0,
+  "config": {
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "epochs": 15,
+    "n_memory": 500,
+    "n_instruct": 0,
+    "n_eval_memory": 50,
+    "n_eval_instruct": 0,
+    "lr": 0.001,
+    "lora_rank": 8,
+    "lora_layers": [
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27
+    ],
+    "log_every": 100,
+    "seed": 42,
+    "device": "cuda",
+    "output_dir": "results/exp_v3_6_parallel_lora",
+    "save_checkpoint": "results/checkpoints/parallel_lora_full_15ep.pt"
+  }
+}
