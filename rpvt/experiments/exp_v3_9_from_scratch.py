@@ -259,8 +259,34 @@ def build_dataset(tokenizer, n_memory=500, n_instruct=10000,
     return all_docs
 
 
+def save_checkpoint(model, optimizer, scheduler, epoch, global_step, path):
+    """Save full training state for resume."""
+    state = {
+        "model": {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad},
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+    }
+    torch.save(state, path)
+    print(f"  Checkpoint saved: epoch {epoch + 1}, step {global_step} → {path}")
+
+
+def load_checkpoint(model, optimizer, scheduler, path, device):
+    """Load training state to resume."""
+    state = torch.load(path, map_location=device)
+    for name, param in model.named_parameters():
+        if param.requires_grad and name in state["model"]:
+            param.data.copy_(state["model"][name])
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    print(f"  Resumed from epoch {state['epoch'] + 1}, step {state['global_step']}")
+    return state["epoch"], state["global_step"]
+
+
 def train(model, tokenizer, train_docs, eval_docs, device,
-          num_epochs=15, lr_memory=1e-3, lr_lora=2e-4, log_every=50):
+          num_epochs=15, lr_memory=1e-3, lr_lora=2e-4, log_every=50,
+          checkpoint_dir=None, resume_from=None):
     """Train memory + instruct jointly from scratch."""
     memory_params = get_memory_params(model)
     lora_params = get_lora_params(model)
@@ -298,10 +324,21 @@ def train(model, tokenizer, train_docs, eval_docs, device,
     print(f"  {total_steps} total steps, {num_epochs} epochs")
     model.train()
     global_step = 0
+    start_epoch = 0
     losses = {"memory": [], "instruct": []}
     start_time = time.time()
 
-    for epoch in range(num_epochs):
+    # Resume from checkpoint if provided
+    if resume_from and os.path.exists(resume_from):
+        start_epoch, global_step = load_checkpoint(
+            model, optimizer, scheduler, resume_from, device
+        )
+        start_epoch += 1  # start from next epoch
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    for epoch in range(start_epoch, num_epochs):
         order = list(range(len(train_docs)))
         random.shuffle(order)
 
@@ -374,6 +411,23 @@ def train(model, tokenizer, train_docs, eval_docs, device,
         print(f"  Memory recall: {eval_results['memory_token_acc']:.1%} "
               f"({eval_results['memory_correct']}/{eval_results['memory_total']})")
         print(f"  Instruct loss: {eval_results['instruct_loss']:.3f}")
+
+        # Save checkpoint every epoch
+        if checkpoint_dir:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, global_step,
+                os.path.join(checkpoint_dir, "latest.pt"),
+            )
+            # Also save best by recall
+            if not hasattr(train, '_best_recall'):
+                train._best_recall = 0
+            if eval_results['memory_token_acc'] > train._best_recall:
+                train._best_recall = eval_results['memory_token_acc']
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, global_step,
+                    os.path.join(checkpoint_dir, "best.pt"),
+                )
+
         model.train()
 
     return evaluate(model, tokenizer, eval_docs, device)
@@ -541,6 +595,10 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="results/exp_v3_9_from_scratch")
     parser.add_argument("--save-checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Directory for per-epoch checkpoints (enables resume)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -567,10 +625,14 @@ def main():
         inst_max_len=args.inst_max_len, seed=args.seed + 1000,
     )
 
+    # Default checkpoint dir to output_dir/checkpoints
+    checkpoint_dir = args.checkpoint_dir or os.path.join(args.output_dir, "checkpoints")
+
     results = train(
         model, tokenizer, train_docs, eval_docs, args.device,
         num_epochs=args.epochs, lr_memory=args.lr_memory,
         lr_lora=args.lr_lora, log_every=args.log_every,
+        checkpoint_dir=checkpoint_dir, resume_from=args.resume,
     )
 
     if args.save_checkpoint:
