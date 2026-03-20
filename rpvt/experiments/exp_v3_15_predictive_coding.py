@@ -226,7 +226,13 @@ def train(system, inverse, kv_memory, wrappers, tokenizer,
                 )
 
             # Predictive coding cycle: observe → predict → modulate
-            output, cycle_errors = system(qa_chunk, n_cycles=n_cycles, **kwargs)
+            # Find answer start from mask to prevent leakage
+            ans_positions = answer_mask.nonzero(as_tuple=True)[0]
+            answer_start = ans_positions[0].item() + 1 if len(ans_positions) > 0 else None
+
+            output, cycle_errors = system(
+                qa_chunk, n_cycles=n_cycles, answer_start=answer_start, **kwargs
+            )
 
             # Answer loss
             logits = output.logits[:, :-1].reshape(-1, output.logits.size(-1))
@@ -321,7 +327,12 @@ def evaluate(system, kv_memory, tokenizer, eval_docs, device, n_cycles=2):
                     1, n_past + seq_len, device=device, dtype=torch.long
                 )
 
-            output, _ = system(qa_chunk, n_cycles=n_cycles, **kwargs)
+            ans_positions = answer_mask[:-1].nonzero(as_tuple=True)[0]
+            answer_start = ans_positions[0].item() + 1 if len(ans_positions) > 0 else None
+
+            output, _ = system(
+                qa_chunk, n_cycles=n_cycles, answer_start=answer_start, **kwargs
+            )
 
             predictions = output.logits[0, :-1].argmax(dim=-1)
             targets = qa_chunk[0, 1:]

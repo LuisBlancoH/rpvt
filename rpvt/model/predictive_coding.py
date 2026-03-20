@@ -231,7 +231,8 @@ class RecurrentPredictiveCoding(nn.Module):
         return output
 
     def forward(self, input_ids, n_cycles=2, past_key_values=None,
-                position_ids=None, attention_mask=None):
+                position_ids=None, attention_mask=None,
+                answer_start=None):
         """Full predictive coding cycle: observe → predict → modulate.
 
         Args:
@@ -240,6 +241,8 @@ class RecurrentPredictiveCoding(nn.Module):
             past_key_values: stored KV cache (memory)
             position_ids: for KV cache offset
             attention_mask: for KV cache
+            answer_start: if set, observe only uses tokens[:answer_start]
+                          to prevent answer leakage
 
         Returns:
             output: model output from final modulated pass
@@ -247,16 +250,37 @@ class RecurrentPredictiveCoding(nn.Module):
         """
         all_errors = []
 
-        # Pass 1: observe (no modulation)
-        obs = self.observe(input_ids)
+        # Pass 1: observe (no modulation, question-only to prevent leakage)
+        if answer_start is not None and answer_start > 0:
+            observe_ids = input_ids[:, :answer_start]
+        else:
+            observe_ids = input_ids
+
+        obs = self.observe(observe_ids)
         hidden_states = obs.hidden_states
 
         for cycle in range(n_cycles):
-            # Predict + compute errors
+            # Predict + compute errors (from question-only hidden states)
             errors, magnitudes = self.predict_and_error(hidden_states)
             all_errors.append(magnitudes)
 
-            # Pass 2+: modulated forward
+            # Pad errors to match full input_ids length if needed
+            if answer_start is not None and answer_start > 0:
+                full_len = input_ids.shape[1]
+                padded_errors = {}
+                for layer_idx, error in errors.items():
+                    pad_size = full_len - error.shape[1]
+                    if pad_size > 0:
+                        padded_errors[layer_idx] = torch.cat([
+                            error,
+                            torch.zeros(error.shape[0], pad_size, error.shape[2],
+                                       device=error.device, dtype=error.dtype),
+                        ], dim=1)
+                    else:
+                        padded_errors[layer_idx] = error
+                errors = padded_errors
+
+            # Pass 2+: modulated forward on full input
             output = self.modulated_forward(
                 input_ids, errors,
                 past_key_values=past_key_values,
@@ -264,14 +288,11 @@ class RecurrentPredictiveCoding(nn.Module):
                 attention_mask=attention_mask,
             )
 
-            # For next cycle, use modulated hidden states
+            # For next cycle, observe again with modulation active
             if cycle < n_cycles - 1:
                 with torch.no_grad():
                     mod_obs = self.model(
-                        input_ids, output_hidden_states=True,
-                        past_key_values=past_key_values,
-                        position_ids=position_ids,
-                        attention_mask=attention_mask,
+                        observe_ids, output_hidden_states=True,
                     )
                 hidden_states = mod_obs.hidden_states
 
