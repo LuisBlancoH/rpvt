@@ -198,3 +198,87 @@ class MemoryDecoder(nn.Module):
     def param_count(self):
         """Return total parameter count."""
         return sum(p.numel() for p in self.parameters())
+
+
+class DecoderInjectionWrapper(nn.Module):
+    """Wraps a transformer layer to inject decoded memory as extra KV pairs.
+
+    Like MemoryAugmentedAttention but uses decoded tokens from the
+    MemoryDecoder instead of raw memory vectors. The decoder has already
+    processed and organized the memory — these are rich, contextualized
+    representations, not raw compressed hidden states.
+
+    The decoded tokens are projected through the layer's own k_proj/v_proj
+    (same as the original cross-attention approach) but the input is
+    much higher quality because the decoder organized it.
+    """
+
+    def __init__(self, original_layer, decoder, memory_bank):
+        super().__init__()
+        self.layer = original_layer
+        self.decoder = decoder
+        self.memory_bank = memory_bank
+
+        # Cache decoded memory to avoid recomputing for each layer call
+        self._cached_context = None
+        self._cache_valid = False
+
+    def invalidate_cache(self):
+        """Call after memory changes (new chunk processed)."""
+        self._cached_context = None
+        self._cache_valid = False
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.layer, name)
+
+    def _get_decoded_memory(self):
+        """Get decoded memory tokens, using cache if valid."""
+        if self._cache_valid and self._cached_context is not None:
+            return self._cached_context
+
+        mem_states, n_active = self.memory_bank.get_active_memories()
+        if n_active == 0:
+            self._cached_context = None
+            self._cache_valid = True
+            return None
+
+        context = self.decoder(mem_states, n_active)
+        self._cached_context = context
+        self._cache_valid = True
+        return context
+
+    def forward(self, *args, **kwargs):
+        """Run normal layer forward, then add decoded memory to residual.
+
+        Uses the ParallelCrossAttention pattern: run the layer normally,
+        then add a cross-attention output from decoded memory. The decoder
+        produces rich context that gets cross-attended to by the layer output.
+        """
+        outputs = self.layer(*args, **kwargs)
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+
+        decoded = self._get_decoded_memory()
+        if decoded is not None:
+            # Cross-attend: hidden_states query → decoded memory KV
+            decoded = decoded.to(dtype=hidden_states.dtype)
+            bsz, seq_len, hdim = hidden_states.shape
+            n_decoded = decoded.shape[1]
+
+            # Simple scaled dot-product attention
+            # Q from hidden states, K/V from decoded memory
+            scale = hdim ** -0.5
+            attn = torch.matmul(hidden_states, decoded.transpose(-2, -1)) * scale
+            attn = F.softmax(attn, dim=-1)  # (bsz, seq_len, n_decoded)
+            mem_output = torch.matmul(attn, decoded)  # (bsz, seq_len, hdim)
+
+            # Scale down to not overwhelm — decoder learns the right magnitude
+            hidden_states = hidden_states + 0.1 * mem_output
+
+            if isinstance(outputs, tuple):
+                return (hidden_states,) + outputs[1:]
+            return hidden_states
+
+        return outputs
