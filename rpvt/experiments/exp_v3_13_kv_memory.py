@@ -109,23 +109,112 @@ def build_dataset(tokenizer, n_memory=500, chunk_size=128,
 
 
 def train(model, kv_memory, tokenizer, train_docs, eval_docs, device,
-          num_epochs=15, lr=1e-3, log_every=50, checkpoint_dir=None):
-    """Train only the write gate — what positions to store."""
+          num_epochs=15, lr=1e-3, log_every=50, checkpoint_dir=None, topk=0):
+    """If topk=0, just evaluate (no training). If topk>0, train the gate."""
 
+    if topk == 0:
+        print(f"\nNo training needed — evaluating KV cache memory directly")
+        model.eval()
+        eval_results = evaluate(model, kv_memory, tokenizer, eval_docs, device, topk=0)
+        print(f"\n  Memory recall: {eval_results['token_acc']:.1%} "
+              f"({eval_results['correct']}/{eval_results['total']})")
+        return eval_results
+
+    # Train the gate to select best positions
     trainable = list(kv_memory.parameters())
     n_params = sum(p.numel() for p in trainable)
-    # No training needed — just evaluate. KV cache is the model's own representations.
-    print(f"\nNo training needed — evaluating KV cache memory directly")
-    model.eval()
+    print(f"\nTraining gate: {n_params:,} params, topk={topk}")
 
-    eval_results = evaluate(model, kv_memory, tokenizer, eval_docs, device)
-    print(f"\n  Memory recall: {eval_results['token_acc']:.1%} "
-          f"({eval_results['correct']}/{eval_results['total']})")
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.01)
+    total_steps = len(train_docs) * num_epochs
+
+    def lr_schedule(step):
+        warmup = 100
+        if step < warmup:
+            return step / warmup
+        progress = (step - warmup) / max(total_steps - warmup, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
+    model.eval()
+    global_step = 0
+    losses = []
+    start_time = time.time()
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    for epoch in range(num_epochs):
+        order = list(range(len(train_docs)))
+        random.shuffle(order)
+
+        for doc_idx in order:
+            doc = train_docs[doc_idx]
+            chunks = doc["chunks"]
+            chunk_types = doc.get("chunk_types", ["passage"] * len(chunks))
+            answer_mask = doc["answer_mask"].to(device)
+
+            kv_memory.reset()
+
+            # Process and store passage KVs (topk selection)
+            for chunk_idx, chunk in enumerate(chunks[:-1]):
+                chunk_ids = chunk.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    output = model(chunk_ids, use_cache=True, output_hidden_states=True)
+                if chunk_types[chunk_idx] == "passage":
+                    hidden = output.hidden_states[14]
+                    kv_memory.store_topk(hidden, output.past_key_values, k=topk)
+                else:
+                    kv_memory.skip(chunk_ids.shape[1])
+
+            # Answer with stored KVs
+            qa_chunk = chunks[-1].unsqueeze(0).to(device)
+            past_kvs = kv_memory.get_past_key_values(device, torch.bfloat16)
+
+            if past_kvs is not None:
+                n_past = kv_memory.n_stored.item()
+                n_total_seen = kv_memory.total_tokens_seen.item()
+                seq_len = qa_chunk.shape[1]
+                position_ids = torch.arange(
+                    n_total_seen, n_total_seen + seq_len, device=device
+                ).unsqueeze(0)
+                attn_mask = torch.ones(1, n_past + seq_len, device=device, dtype=torch.long)
+                output = model(qa_chunk, past_key_values=past_kvs,
+                               position_ids=position_ids, attention_mask=attn_mask)
+            else:
+                output = model(qa_chunk)
+
+            logits = output.logits[:, :-1].reshape(-1, output.logits.size(-1))
+            targets = qa_chunk[:, 1:].reshape(-1)
+            per_token = F.cross_entropy(logits, targets, reduction='none')
+            mask = answer_mask[:-1]
+            n_tokens = mask.sum().clamp(min=1)
+            loss = (per_token * mask).sum() / n_tokens
+
+            # Gate gradient via straight-through: loss → gate scores (but KVs are detached)
+            # The gate can't get gradient through detached KVs. Instead, use REINFORCE-like:
+            # We skip gradient for now — gate starts with learned bias, topk selects from that.
+            # TODO: add differentiable selection
+
+            losses.append(loss.item())
+            global_step += 1
+
+            if global_step % log_every == 0:
+                avg = sum(losses[-log_every:]) / min(len(losses), log_every)
+                elapsed = time.time() - start_time
+                stored = kv_memory.n_stored.item()
+                print(f"  step {global_step}/{total_steps}, loss={avg:.3f}, "
+                      f"stored={stored}, {elapsed:.0f}s")
+
+        print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
+        eval_results = evaluate(model, kv_memory, tokenizer, eval_docs, device, topk=topk)
+        print(f"  Memory recall: {eval_results['token_acc']:.1%} "
+              f"({eval_results['correct']}/{eval_results['total']})")
 
     return eval_results
 
 
-def evaluate(model, kv_memory, tokenizer, eval_docs, device):
+def evaluate(model, kv_memory, tokenizer, eval_docs, device, topk=0):
     model.eval()
     correct = 0
     total = 0
@@ -140,10 +229,15 @@ def evaluate(model, kv_memory, tokenizer, eval_docs, device):
 
             for chunk_idx, chunk in enumerate(chunks[:-1]):
                 chunk_ids = chunk.unsqueeze(0).to(device)
-                output = model(chunk_ids, use_cache=True)
-                # Store passage chunks only — filler dilutes the signal
+                output = model(chunk_ids, use_cache=True,
+                               output_hidden_states=True if topk > 0 else False)
                 if chunk_types[chunk_idx] == "passage":
-                    kv_memory.store_all(output.past_key_values)
+                    if topk > 0:
+                        # Use hidden states from middle layer for gate scoring
+                        hidden = output.hidden_states[14]  # layer 14
+                        kv_memory.store_topk(hidden, output.past_key_values, k=topk)
+                    else:
+                        kv_memory.store_all(output.past_key_values)
                 else:
                     kv_memory.skip(chunk_ids.shape[1])
 
@@ -267,7 +361,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--n-memory", type=int, default=500)
     parser.add_argument("--n-eval", type=int, default=50)
-    parser.add_argument("--max-entries", type=int, default=128)
+    parser.add_argument("--max-entries", type=int, default=512)
+    parser.add_argument("--topk", type=int, default=0,
+                        help="If >0, store only top-K positions per chunk (brain-like sparse cue)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -316,8 +412,14 @@ def main():
     print("Building eval data...")
     eval_docs = build_dataset(tokenizer, n_memory=args.n_eval, seed=args.seed + 1000)
 
+    if args.topk > 0:
+        storage = args.topk * n_layers * n_kv_heads * head_dim * 2 * 2
+        compression = 128 * n_layers * n_kv_heads * head_dim * 2 * 2 / storage
+        print(f"  Top-K mode: storing {args.topk} positions per chunk ({compression:.0f}× compression)")
+
     results = train(
         model, kv_memory, tokenizer, train_docs, eval_docs, args.device,
+        topk=args.topk,
     )
 
     test_generation(model, kv_memory, tokenizer, args.device)

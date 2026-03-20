@@ -171,12 +171,59 @@ class KVMemoryBank(nn.Module):
         self.n_stored = torch.clamp(self.write_ptr, max=self.max_entries)
         self.total_tokens_seen = self.total_tokens_seen + seq_len
 
-    def skip(self, n_tokens):
-        """Record that tokens were processed but not stored.
+    def store_topk(self, hidden_states, kv_cache, k=8):
+        """Store only the top-K most important token positions.
 
-        Updates total_tokens_seen for correct position encoding
-        at query time.
+        Uses the gate to score each position, then stores the KV pairs
+        for only the highest-scoring positions. Real KV pairs, not
+        reconstructed — the model recognizes them natively.
+
+        Like the hippocampus: sparse cue, cortex completes the pattern.
+
+        Args:
+            hidden_states: (batch, seq_len, hidden_size) for gate scoring
+            kv_cache: DynamicCache from model forward pass
+            k: number of positions to keep per chunk
         """
+        param_dtype = self.gate.weight.dtype
+        x = hidden_states.to(dtype=param_dtype)
+
+        # Score each position
+        scores = self.gate(x).squeeze(0).squeeze(-1)  # (seq_len,)
+        seq_len = scores.shape[0]
+        k_actual = min(k, seq_len, self.max_entries - self.write_ptr.item())
+
+        if k_actual <= 0:
+            self.total_tokens_seen = self.total_tokens_seen + seq_len
+            return
+
+        # Select top-k positions
+        _, top_indices = scores.topk(k_actual)
+        top_indices_sorted = top_indices.sort().values  # keep order
+
+        # Store real KV pairs for selected positions
+        start = self.write_ptr.item()
+        for layer_idx in range(self.n_layers):
+            layer_cache = kv_cache.layers[layer_idx]
+            layer_keys = layer_cache.keys[0]    # (n_kv_heads, seq_len, head_dim)
+            layer_values = layer_cache.values[0]
+
+            selected_keys = layer_keys[:, top_indices_sorted, :]
+            selected_values = layer_values[:, top_indices_sorted, :]
+
+            keys_buf = getattr(self, f"keys_{layer_idx}")
+            values_buf = getattr(self, f"values_{layer_idx}")
+
+            end = start + k_actual
+            keys_buf[start:end] = selected_keys.transpose(0, 1).detach()
+            values_buf[start:end] = selected_values.transpose(0, 1).detach()
+
+        self.write_ptr = self.write_ptr + k_actual
+        self.n_stored = torch.clamp(self.write_ptr, max=self.max_entries)
+        self.total_tokens_seen = self.total_tokens_seen + seq_len
+
+    def skip(self, n_tokens):
+        """Record that tokens were processed but not stored."""
         self.total_tokens_seen = self.total_tokens_seen + n_tokens
 
     def get_past_key_values(self, device, dtype):
