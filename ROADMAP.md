@@ -41,15 +41,32 @@ None of these are programmed. They emerge from primitives interacting during tra
 - Generalizes across formats, works on real Wikipedia
 - **Status: COMPLETE**
 
-### Step 1: Instruct + Memory (IN PROGRESS)
+### Step 1: Instruct + Memory (SOLVED)
 **Goal:** A model that can both use memory AND generate coherently.
 
-**Key finding:** You cannot add memory to an instruct model post-hoc. LoRA destroys generation regardless of approach (8 approaches tried, all failed). The brain develops memory and skills together from birth.
+**Key finding:** You cannot inject foreign signals into a frozen instruct model (33% ceiling regardless of method — soft prompts, decoders, parallel cross-attention, all identical). And LoRA destroys generation regardless of regularization (KL, surprise weighting, all failed).
 
-**Solution:** Train from scratch — base model + LoRA + memory + 10k instruct examples.
-- v3.9 running overnight (ETA ~10h)
-- Same recipe scales to any base model (7B, 30B-A3B, etc.)
-- **Status: RUNNING**
+**Solution: KV Cache Memory — brain-like pattern reinstatement (v3.13)**
+- Store the model's OWN KV cache from passage processing
+- Restore at query time as past_key_values
+- The model "re-experiences" the passage through native representations
+- **74.7% recall + perfect generation + zero training + zero LoRA**
+- Like the hippocampus reinstating original cortical activity patterns
+
+**Approaches tried (12 total):**
+1. LoRA on instruct → 86% recall, broken generation
+2. Joint training v3.5 → 79% recall, broken generation
+3. Parallel cross-attention, no LoRA → 33% recall, perfect generation
+4. Parallel cross-attention + LoRA → 81% recall, broken generation
+5. Soft prompts → 33% recall, coherent generation
+6. Surprise-weighted LoRA → 69% recall, broken generation
+7. From-scratch training → 83% recall, broken generation (insufficient instruct data)
+8. KL divergence regularization → 24% recall (too conservative)
+9. Memory decoder (prepend) → 33% recall (same ceiling)
+10. Memory decoder (mid-layer) → 27% recall (same ceiling)
+11. **KV cache memory → 74.7% recall, PERFECT generation**
+
+**Status: COMPLETE — KV cache approach works**
 
 ### Step 2: Predictive Memory (~1 day)
 **Goal:** Replace learned bias gate with prediction-error routing.
