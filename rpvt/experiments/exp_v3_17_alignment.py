@@ -257,13 +257,14 @@ def main():
     # Create inverse with persistent state
     inverse = PersistentInverseTransformer(
         hidden_size, n_inverse_layers=len(target_layers),
-        target_layers=target_layers, state_dim=512, n_heads=8,
+        target_layers=target_layers, n_heads=8,
+        max_context_tokens=256,
     ).to(args.device, dtype=torch.bfloat16)
 
     system = PredictiveCodingSystem(model, inverse, target_layers, captures)
 
     n_inv = sum(p.numel() for p in inverse.parameters())
-    print(f"  Inverse: {n_inv:,} params (persistent state_dim=512)")
+    print(f"  Inverse: {n_inv:,} params (persistent KV cache, max 256 tokens)")
     print(f"  Target layers: {target_layers}")
     print(f"  Forward model: frozen, no LoRA")
 

@@ -46,19 +46,21 @@ class InverseLayer(nn.Module):
 
 
 class PersistentInverseTransformer(nn.Module):
-    """Inverse transformer with persistent state across chunks.
+    """Inverse transformer with native KV cache persistence.
 
-    The GRU accumulates context: after processing chunk 1, the state
-    encodes "I've seen a briefing about VIPER-371." This state
-    conditions predictions for chunk 2 — the inverse EXPECTS
-    certain patterns and is surprised by others.
+    The inverse's own KV cache persists across chunks. When processing
+    chunk N, the inverse can attend to its own representations from
+    chunks 1..N-1. The processing network IS the state.
+
+    No GRU. No summary tokens. Just the inverse transformer's own
+    attention history persisting across chunks.
 
     Args:
         hidden_size: must match forward model
         n_inverse_layers: depth of inverse transformer
         target_layers: which forward layers to predict
-        state_dim: dimension of persistent context state
         n_heads: attention heads
+        max_context_tokens: max KV cache entries per layer
     """
 
     def __init__(
@@ -66,17 +68,14 @@ class PersistentInverseTransformer(nn.Module):
         hidden_size: int,
         n_inverse_layers: int = 3,
         target_layers: list = None,
-        state_dim: int = 512,
         n_heads: int = 8,
+        max_context_tokens: int = 512,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.target_layers = target_layers or [7, 14, 21]
-        self.state_dim = state_dim
-
-        # Persistent context state (GRU accumulates across chunks)
-        self.context_gru = nn.GRUCell(hidden_size, state_dim)
-        self.context_proj = nn.Linear(state_dim, hidden_size, bias=False)
+        self.n_heads = n_heads
+        self.max_context_tokens = max_context_tokens
 
         # Inverse transformer layers
         self.layers = nn.ModuleList([
@@ -90,78 +89,71 @@ class PersistentInverseTransformer(nn.Module):
             for _ in range(len(self.target_layers))
         ])
 
-        # Persistent state
-        self.persistent_state = None
+        # Persistent KV cache: list of (K, V) per layer
+        self.persistent_kvs = None
 
         # Initialize small
         for head in self.prediction_heads:
             nn.init.normal_(head.weight, std=0.01)
-        nn.init.normal_(self.context_proj.weight, std=0.02)
 
     def reset_state(self):
-        """Reset persistent state (new document/session)."""
-        self.persistent_state = None
+        """Reset persistent KV cache (new document/session)."""
+        self.persistent_kvs = None
 
     def update_context(self, output_hidden):
-        """Update persistent state with new chunk information.
+        """Process chunk through inverse and accumulate KV cache.
 
-        Args:
-            output_hidden: (batch, seq_len, hidden_size) from forward output layer
+        This is both prediction AND context building in one pass.
+        The inverse processes the current chunk's hidden states,
+        attending to all previous processing via persistent KV cache.
+        The new KV pairs are added to the cache.
         """
-        # Pool the chunk to a single vector
-        chunk_summary = output_hidden.mean(dim=1).squeeze(0)  # (hidden_size,)
-
-        # Compress to state_dim for GRU
-        if self.persistent_state is not None:
-            state = self.persistent_state
-        else:
-            state = torch.zeros(
-                self.state_dim,
-                device=chunk_summary.device,
-                dtype=chunk_summary.dtype,
-            )
-
-        # Update persistent state
-        # GRU input needs (1, hidden_size) → compress first
-        gru_input = chunk_summary[:self.state_dim].unsqueeze(0)
-        if gru_input.shape[1] < self.state_dim:
-            gru_input = F.pad(gru_input, (0, self.state_dim - gru_input.shape[1]))
-
-        new_state = self.context_gru(gru_input, state.unsqueeze(0))
-        self.persistent_state = new_state.squeeze(0).detach()
+        # Just call predict — it updates the KV cache as a side effect
+        self.predict(output_hidden)
 
     def predict(self, output_hidden):
-        """Generate predictions for target layers.
+        """Generate predictions with persistent KV cache.
 
-        Predictions are conditioned on:
-        1. The current chunk's output (what just happened)
-        2. The persistent state (what happened before)
+        The inverse processes the current chunk (128 tokens of h₂₁)
+        through its layers. At each layer, self-attention includes
+        the persistent KV cache (all previous chunks' processing).
 
-        Args:
-            output_hidden: (batch, seq_len, hidden_size)
-
-        Returns:
-            predictions: {layer_idx: (batch, seq_len, hidden_size)}
+        New KV pairs from this chunk are appended to the cache.
         """
-        x = output_hidden
-
-        # Condition on persistent state if available
-        if self.persistent_state is not None:
-            context = self.context_proj(self.persistent_state)  # (hidden_size,)
-            # Add context to every position
-            context = context.unsqueeze(0).unsqueeze(0)  # (1, 1, hidden_size)
-            x = x + context.expand_as(x)
-
-        # Run inverse layers, generate predictions
+        x = output_hidden  # (1, seq_len, hidden_size) — typically 128 tokens
         predictions = {}
+        new_kvs = []
+
         targets_rev = list(reversed(self.target_layers))
         heads_rev = list(reversed(list(self.prediction_heads)))
 
         for i, layer in enumerate(self.layers):
-            x = layer(x)
+            h = layer.ln1(x)
+
+            # Build K, V for attention: persistent cache + current tokens
+            if self.persistent_kvs is not None and i < len(self.persistent_kvs):
+                old_k, old_v = self.persistent_kvs[i]
+                k_all = torch.cat([old_k.to(h.dtype), h], dim=1)
+                v_all = torch.cat([old_v.to(h.dtype), h], dim=1)
+            else:
+                k_all = h
+                v_all = h
+
+            # Self-attention: current tokens query all (past + current)
+            attn_out = layer.attn(h, k_all, v_all, need_weights=False)[0]
+            x = x + attn_out
+            x = x + layer.ffn(layer.ln2(x))
+
+            # Accumulate KV cache (truncate to max)
+            new_k = k_all[:, -self.max_context_tokens:].detach()
+            new_v = v_all[:, -self.max_context_tokens:].detach()
+            new_kvs.append((new_k, new_v))
+
+            # Generate prediction for this target layer
             if i < len(targets_rev):
                 predictions[targets_rev[i]] = heads_rev[i](x)
 
+        self.persistent_kvs = new_kvs
         return predictions
 
 
