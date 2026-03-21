@@ -1,21 +1,14 @@
-"""Experiment v3.17: Predictive coding alignment (no memory).
+"""Experiment v3.17: Predictive Coding Alignment (v2 — persistent state).
 
-Train ONLY the predictive coding system — no memory, no recall task.
+Train the inverse transformer to predict the forward model's hidden
+states. The inverse maintains persistent state across chunks — a
+running world model. No memory, no recall, no LoRA.
 
-Goal: align the forward model (instruct + LoRA) with the inverse
-transformer so that prediction errors become meaningful signals.
-
-Two losses only:
-  1. Prediction loss: inverse predicts forward hidden states
-  2. Consistency loss: LoRA makes forward predictable by inverse
-
-No answer loss. No KV cache. No memory. Just alignment.
-
-After alignment:
-  - The inverse can predict what the forward model does
-  - The error signals are meaningful (not noise)
-  - Generation should survive (consistency is gentle, no recall pressure)
-  - THEN add memory on top of the aligned system
+Questions we answer:
+1. Does the inverse learn to predict the forward model? (prediction loss drops)
+2. Does the persistent state encode meaningful context? (errors differ for
+   expected vs unexpected content)
+3. Does the forward model's generation survive? (no weights changed)
 """
 
 import argparse
@@ -27,154 +20,181 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import get_peft_model, LoraConfig, TaskType
 
-from rpvt.model.dual_network import (
-    InverseTransformer, DualModulationWrapper, DualNetworkSystem,
+from rpvt.model.predictive_coding_v2 import (
+    PersistentInverseTransformer, HiddenStateCapture, PredictiveCodingSystem,
 )
 
 
-def build_text_dataset(tokenizer, n_docs=5000, chunk_size=128, seed=42):
-    """Just raw text chunks. No QA, no memory, no filler distinction."""
+def build_text_chunks(tokenizer, n_docs=5000, chunk_size=128, seed=42):
+    """Raw text chunks from WikiText."""
     rng = random.Random(seed)
-
-    print(f"  Loading WikiText...")
+    print("  Loading WikiText...")
     wiki = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
     texts = [t for t in wiki["text"] if len(t.strip()) > 100]
     rng.shuffle(texts)
 
-    docs = []
-    for text in texts[:n_docs * 2]:
+    chunks = []
+    for text in texts:
         tokens = tokenizer.encode(text, add_special_tokens=False)
         if len(tokens) < 20:
             continue
-
         if len(tokens) >= chunk_size:
             start = rng.randint(0, len(tokens) - chunk_size)
             ct = tokens[start:start + chunk_size]
         else:
-            ct = tokens + [tokenizer.eos_token_id or 0] * (chunk_size - len(tokens))
-
-        docs.append(torch.tensor(ct, dtype=torch.long))
-
-        if len(docs) >= n_docs:
+            ct = tokens + [tokenizer.eos_token_id or 0] * (chunk_size - len(ct))
+        chunks.append(torch.tensor(ct, dtype=torch.long))
+        if len(chunks) >= n_docs:
             break
 
-    print(f"  Dataset: {len(docs)} text chunks")
-    return docs
+    print(f"  {len(chunks)} text chunks")
+    return chunks
 
 
-def train(system, tokenizer, train_chunks, eval_chunks, device,
-          num_epochs=10, lr_inverse=1e-3, lr_lora=1e-5,
-          alpha_consist=1.0, log_every=100, checkpoint_dir=None):
-    """Align forward and inverse — no task loss, just prediction + consistency."""
+def build_document_sequences(tokenizer, n_docs=500, chunks_per_doc=5,
+                             chunk_size=128, seed=42):
+    """Multi-chunk documents for testing persistent state.
 
-    inverse_params = list(system.inverse.parameters())
-    lora_params = [p for n, p in system.forward_model.named_parameters()
-                   if p.requires_grad and "lora" in n.lower()]
-    scale_params = [w.scale for w in system.wrappers.values()]
+    Each document is a sequence of related chunks from the same article.
+    The inverse should build up context across chunks.
+    """
+    rng = random.Random(seed)
+    print("  Loading WikiText for documents...")
+    wiki = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+    texts = [t for t in wiki["text"] if len(t.strip()) > chunk_size * chunks_per_doc]
+    rng.shuffle(texts)
 
-    optimizer = torch.optim.AdamW([
-        {"params": inverse_params, "lr": lr_inverse},
-        {"params": lora_params, "lr": lr_lora},
-        {"params": scale_params, "lr": lr_inverse},
-    ], weight_decay=0.01)
+    documents = []
+    for text in texts[:n_docs]:
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        doc_chunks = []
+        for i in range(0, min(len(tokens), chunks_per_doc * chunk_size), chunk_size):
+            ct = tokens[i:i + chunk_size]
+            if len(ct) < chunk_size:
+                ct = ct + [tokenizer.eos_token_id or 0] * (chunk_size - len(ct))
+            doc_chunks.append(torch.tensor(ct, dtype=torch.long))
+            if len(doc_chunks) >= chunks_per_doc:
+                break
 
-    total_steps = len(train_chunks) * num_epochs
-    print(f"\nAlignment training:")
-    print(f"  Inverse: {sum(p.numel() for p in inverse_params):,} params (lr={lr_inverse})")
-    print(f"  LoRA: {sum(p.numel() for p in lora_params):,} params (lr={lr_lora})")
-    print(f"  {total_steps} steps, {num_epochs} epochs")
-    print(f"  Losses: prediction + {alpha_consist}× consistency (NO answer loss)")
+        if len(doc_chunks) >= 2:
+            documents.append(doc_chunks)
+
+    print(f"  {len(documents)} documents, {chunks_per_doc} chunks each")
+    return documents
+
+
+def train(system, train_docs, device, num_epochs=10, lr=1e-3,
+          log_every=200):
+    """Train inverse to predict forward model on multi-chunk documents."""
+
+    trainable = list(system.inverse.parameters())
+    n_params = sum(p.numel() for p in trainable)
+    print(f"\nTraining inverse: {n_params:,} params")
+
+    optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.01)
+
+    total_chunks = sum(len(doc) for doc in train_docs) * num_epochs
 
     def lr_schedule(step):
         warmup = 200
         if step < warmup:
             return step / warmup
-        progress = (step - warmup) / max(total_steps - warmup, 1)
+        progress = (step - warmup) / max(total_chunks - warmup, 1)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
-    system.forward_model.train()
+    print(f"  {total_chunks} total chunks, {num_epochs} epochs")
     system.inverse.train()
     global_step = 0
-    losses_pred = []
-    losses_consist = []
+    losses = []
     start_time = time.time()
 
-    if checkpoint_dir:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
     for epoch in range(num_epochs):
-        order = list(range(len(train_chunks)))
+        order = list(range(len(train_docs)))
         random.shuffle(order)
 
-        for idx in order:
-            chunk_ids = train_chunks[idx].unsqueeze(0).to(device)
+        for doc_idx in order:
+            doc = train_docs[doc_idx]
+            system.reset()  # new document → reset persistent state
 
-            # Forward pass — no modulation during alignment
-            for w in system.wrappers.values():
-                w.disable_modulation()
+            for chunk in doc:
+                chunk_ids = chunk.unsqueeze(0).to(device)
 
-            output = system.forward_model(chunk_ids)
-            hidden_dict = system.get_captured_hidden_states()
+                loss = system.prediction_loss(chunk_ids)
 
-            # Prediction loss: inverse learns to predict forward
-            pred_loss = system.prediction_loss(hidden_dict)
+                if loss.item() > 0 and not torch.isnan(loss):
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                    optimizer.step()
+                    scheduler.step()
 
-            # Consistency loss: forward learns to be predictable
-            consist_loss = system.consistency_loss(hidden_dict)
+                losses.append(loss.item())
+                global_step += 1
 
-            total_loss = pred_loss + alpha_consist * consist_loss
+                if global_step % log_every == 0:
+                    avg = sum(losses[-log_every:]) / log_every
+                    elapsed = time.time() - start_time
+                    print(f"  step {global_step}/{total_chunks}, "
+                          f"pred_loss={avg:.4f}, "
+                          f"lr={scheduler.get_last_lr()[0]:.2e}, "
+                          f"{elapsed:.0f}s")
 
-            if not torch.isnan(total_loss):
-                optimizer.zero_grad()
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    inverse_params + lora_params + scale_params, 1.0
-                )
-                optimizer.step()
-                scheduler.step()
-
-            losses_pred.append(pred_loss.item())
-            losses_consist.append(consist_loss.item())
-            global_step += 1
-
-            if global_step % log_every == 0:
-                p_avg = sum(losses_pred[-log_every:]) / log_every
-                c_avg = sum(losses_consist[-log_every:]) / log_every
-                elapsed = time.time() - start_time
-                eta = elapsed / global_step * (total_steps - global_step)
-                print(f"  step {global_step}/{total_steps}, "
-                      f"pred={p_avg:.4f}, consist={c_avg:.4f}, "
-                      f"lr={scheduler.get_last_lr()[0]:.2e}, "
-                      f"{elapsed:.0f}s (ETA {eta/3600:.1f}h)")
-
-        # Eval: check generation quality
+        # Test: does persistent state help?
         print(f"\n  === Epoch {epoch + 1}/{num_epochs} ===")
-        test_generation(system, tokenizer, device)
-
-        if checkpoint_dir:
-            state = {
-                "inverse": {n: p.data.clone() for n, p in system.inverse.named_parameters()},
-                "lora": {n: p.data.clone() for n, p in system.forward_model.named_parameters()
-                         if p.requires_grad},
-                "scales": {li: w.scale.data.clone() for li, w in system.wrappers.items()},
-                "epoch": epoch, "step": global_step,
-            }
-            torch.save(state, os.path.join(checkpoint_dir, "latest.pt"))
+        test_persistent_state(system, train_docs[:20], device)
 
         system.inverse.train()
-        system.forward_model.train()
 
 
-def test_generation(system, tokenizer, device):
-    """Test that generation still works after alignment."""
-    system.forward_model.eval()
+def test_persistent_state(system, test_docs, device):
+    """Test whether persistent state makes predictions better.
+
+    Compare prediction error on chunk N with vs without
+    seeing chunks 1..N-1 first.
+    """
+    system.inverse.eval()
+
+    errors_with_context = []
+    errors_without_context = []
+
+    with torch.no_grad():
+        for doc in test_docs:
+            if len(doc) < 3:
+                continue
+
+            # WITH persistent state: process chunks 1..N-1, then predict chunk N
+            system.reset()
+            for chunk in doc[:-1]:
+                system.process_chunk(chunk.unsqueeze(0).to(device))
+
+            _, _, mags_with = system.process_chunk(doc[-1].unsqueeze(0).to(device))
+            if mags_with:
+                errors_with_context.append(sum(mags_with.values()) / len(mags_with))
+
+            # WITHOUT persistent state: predict chunk N cold
+            system.reset()
+            _, _, mags_without = system.process_chunk(doc[-1].unsqueeze(0).to(device))
+            if mags_without:
+                errors_without_context.append(sum(mags_without.values()) / len(mags_without))
+
+    avg_with = sum(errors_with_context) / max(len(errors_with_context), 1)
+    avg_without = sum(errors_without_context) / max(len(errors_without_context), 1)
+
+    print(f"  Prediction error WITH context:    {avg_with:.4f}")
+    print(f"  Prediction error WITHOUT context: {avg_without:.4f}")
+    if avg_without > 0:
+        improvement = (avg_without - avg_with) / avg_without * 100
+        print(f"  Context improvement: {improvement:.1f}%")
+
+
+def test_generation(model, tokenizer, device):
+    """Verify generation still works (model is frozen, should be perfect)."""
+    model.eval()
 
     def generate(question, max_new=80):
         messages = [{"role": "user", "content": question}]
@@ -184,35 +204,27 @@ def test_generation(system, tokenizer, device):
         tokens = tokenizer.encode(prompt, add_special_tokens=False)
         input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
         with torch.no_grad():
-            out = system.forward_model.generate(
+            out = model.generate(
                 input_ids, max_new_tokens=max_new, do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
         return tokenizer.decode(out[0][len(tokens):], skip_special_tokens=True)
 
-    questions = [
-        "What is the capital of France?",
-        "Write a haiku about the ocean.",
-        "Explain photosynthesis in one sentence.",
-    ]
-
-    for q in questions:
-        resp = generate(q)
+    print("\n  Generation test:")
+    for q in ["What is the capital of France?",
+              "Write a haiku about the ocean."]:
         print(f"  Q: {q}")
-        print(f"  A: {resp[:150]}")
+        print(f"  A: {generate(q)[:150]}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="v3.17: Predictive coding alignment")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--n-train", type=int, default=5000)
-    parser.add_argument("--n-eval", type=int, default=500)
-    parser.add_argument("--lr-inverse", type=float, default=1e-3)
-    parser.add_argument("--lr-lora", type=float, default=1e-5)
-    parser.add_argument("--alpha-consist", type=float, default=1.0)
-    parser.add_argument("--log-every", type=int, default=200)
+    parser.add_argument("--n-docs", type=int, default=500)
+    parser.add_argument("--chunks-per-doc", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="results/exp_v3_17_alignment")
@@ -231,57 +243,49 @@ def main():
     for p in model.parameters():
         p.requires_grad = False
 
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM, r=args.lora_rank,
-        lora_alpha=args.lora_rank * 2, lora_dropout=0.0,
-        target_modules=["q_proj", "v_proj"],
-    )
-    model = get_peft_model(model, lora_config)
-
     hidden_size = model.config.hidden_size
     target_layers = [7, 14, 21]
 
-    base = model.base_model.model
-    layers = base.model.layers if hasattr(base, 'model') else base.layers
-
-    wrappers = []
+    # Wrap target layers with hidden state captures (transparent)
+    layers = model.model.layers
+    captures = []
     for li in target_layers:
-        w = DualModulationWrapper(layers[li], li).to(args.device, dtype=torch.bfloat16)
-        layers[li] = w
-        wrappers.append(w)
+        c = HiddenStateCapture(layers[li], li)
+        layers[li] = c
+        captures.append(c)
 
-    inverse = InverseTransformer(
-        hidden_size, n_layers=len(target_layers),
-        target_layers=target_layers, n_heads=8,
+    # Create inverse with persistent state
+    inverse = PersistentInverseTransformer(
+        hidden_size, n_inverse_layers=len(target_layers),
+        target_layers=target_layers, state_dim=512, n_heads=8,
     ).to(args.device, dtype=torch.bfloat16)
 
-    system = DualNetworkSystem(model, inverse, target_layers, wrappers)
+    system = PredictiveCodingSystem(model, inverse, target_layers, captures)
 
+    n_inv = sum(p.numel() for p in inverse.parameters())
+    print(f"  Inverse: {n_inv:,} params (persistent state_dim=512)")
     print(f"  Target layers: {target_layers}")
-    print(f"  Inverse: {sum(p.numel() for p in inverse.parameters()):,} params")
+    print(f"  Forward model: frozen, no LoRA")
 
-    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    # Test generation before training
+    print("\nPre-training:")
+    test_generation(model, tokenizer, args.device)
 
+    # Build multi-chunk documents
     print("\nBuilding data...")
-    train_chunks = build_text_dataset(tokenizer, n_docs=args.n_train, seed=args.seed)
-    eval_chunks = build_text_dataset(tokenizer, n_docs=args.n_eval, seed=args.seed + 1000)
-
-    print("\nPre-alignment generation test:")
-    test_generation(system, tokenizer, args.device)
-
-    train(
-        system, tokenizer, train_chunks, eval_chunks, args.device,
-        num_epochs=args.epochs, lr_inverse=args.lr_inverse,
-        lr_lora=args.lr_lora, alpha_consist=args.alpha_consist,
-        log_every=args.log_every, checkpoint_dir=checkpoint_dir,
+    train_docs = build_document_sequences(
+        tokenizer, n_docs=args.n_docs,
+        chunks_per_doc=args.chunks_per_doc, seed=args.seed,
     )
 
-    print("\nPost-alignment generation test:")
-    test_generation(system, tokenizer, args.device)
+    # Train
+    train(system, train_docs, args.device,
+          num_epochs=args.epochs, lr=args.lr, log_every=args.log_every)
 
-    results = {"config": vars(args)}
-    with open(Path(args.output_dir) / "results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+    # Test generation after training (should be identical — model frozen)
+    print("\nPost-training:")
+    test_generation(model, tokenizer, args.device)
+
     print(f"\nResults saved to {args.output_dir}/")
 
 
