@@ -123,18 +123,29 @@ class PredictiveBlock(nn.Module):
                 hidden_size, n_mem_heads, dropout=dropout,
                 batch_first=True, bias=False,
             )
-            self.mem_gate = nn.Linear(hidden_size, hidden_size, bias=False)
+            # Gate sees both input AND memory output → learns when to use memory
+            self.mem_gate = nn.Linear(hidden_size * 2, hidden_size, bias=False)
             nn.init.zeros_(self.mem_gate.weight)
         else:
             self.mem_attn = None
 
-        # FFN
+        # FFN (main — processes input before memory retrieval)
         ffn_dim = hidden_size * ffn_mult
         self.ffn = nn.Sequential(
             nn.Linear(hidden_size, ffn_dim, bias=False),
             nn.SiLU(),
             nn.Linear(ffn_dim, hidden_size, bias=False),
         )
+
+        # FFN (memory integration — smaller, processes after retrieval)
+        if n_mem_heads > 0:
+            self.ln_mem_ffn = nn.LayerNorm(hidden_size)
+            mem_ffn_dim = hidden_size * 2  # smaller than main FFN
+            self.mem_ffn = nn.Sequential(
+                nn.Linear(hidden_size, mem_ffn_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(mem_ffn_dim, hidden_size, bias=False),
+            )
 
         # State (recurrence) — attention pooling + GRU
         # Learned query for attention pooling (not mean pooling)
@@ -181,7 +192,11 @@ class PredictiveBlock(nn.Module):
         )
         x = x + self.dropout(attn_out)
 
-        # Memory attention
+        # FFN first — refine understanding before memory retrieval
+        h = self.ln2(x)
+        x = x + self.dropout(self.ffn(h))
+
+        # Memory attention — queries are now processed/refined
         mem_read = torch.zeros_like(x)
         if self.mem_attn is not None and memory_slots is not None:
             h_mem = self.ln_mem(x)
@@ -190,12 +205,14 @@ class PredictiveBlock(nn.Module):
                 h_mem, mem_kv, mem_kv, need_weights=False,
             )
             mem_read = mem_out
-            mem_out = torch.sigmoid(self.mem_gate(mem_out)) * mem_out
-            x = x + mem_out
+            # Gate conditioned on BOTH input and memory content
+            gate_input = torch.cat([x, mem_out], dim=-1)
+            mem_out = torch.sigmoid(self.mem_gate(gate_input)) * mem_out
+            x = x + self.dropout(mem_out)
 
-        # FFN
-        h = self.ln2(x)
-        x = x + self.dropout(self.ffn(h))
+            # Integrate memory with current representation
+            h_int = self.ln_mem_ffn(x)
+            x = x + self.dropout(self.mem_ffn(h_int))
 
         # State update — attention pooling (learned, not mean pooling)
         query = self.state_query.expand(batch_size, -1, -1)
