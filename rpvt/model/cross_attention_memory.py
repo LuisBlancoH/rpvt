@@ -214,10 +214,18 @@ def _get_rotary_and_attention_fns(attn_module):
         )
         return apply_rotary_pos_emb, eager_attention_forward
     else:
-        # Generic fallback — most HF models have these in their module
-        import importlib
-        mod = importlib.import_module(module_name)
-        return mod.apply_rotary_pos_emb, mod.eager_attention_forward
+        # Generic fallback — try common locations
+        try:
+            import importlib
+            mod = importlib.import_module(module_name)
+            return mod.apply_rotary_pos_emb, mod.eager_attention_forward
+        except (ImportError, AttributeError):
+            # Last resort: try qwen2
+            from transformers.models.qwen2.modeling_qwen2 import (
+                apply_rotary_pos_emb,
+                eager_attention_forward,
+            )
+            return apply_rotary_pos_emb, eager_attention_forward
 
 
 class MemoryAugmentedAttention(nn.Module):
