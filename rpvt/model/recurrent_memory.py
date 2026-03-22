@@ -47,9 +47,9 @@ class MemoryExtractor(nn.Module):
         self.n_memory_tokens = n_memory_tokens
         self.hidden_size = hidden_size
 
-        # K+1 learned queries: K for memory, 1 for confidence
+        # K+2 learned queries: K for memory, 1 for confidence, 1 for value
         self.queries = nn.Parameter(
-            torch.randn(n_memory_tokens + 1, hidden_size) * 0.02
+            torch.randn(n_memory_tokens + 2, hidden_size) * 0.02
         )
 
         # Cross-attention for extraction
@@ -72,6 +72,11 @@ class MemoryExtractor(nn.Module):
         self.halt_proj = nn.Linear(hidden_size, 1, bias=True)
         nn.init.constant_(self.halt_proj.bias, 1.0)  # start biased toward stopping
 
+        # Value: predict expected future reward from current state
+        self.value_proj = nn.Linear(hidden_size, 1, bias=True)
+        nn.init.zeros_(self.value_proj.weight)
+        nn.init.zeros_(self.value_proj.bias)
+
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, hidden_states):
@@ -85,7 +90,7 @@ class MemoryExtractor(nn.Module):
             confidence: (batch,) — halt confidence
         """
         batch = hidden_states.shape[0]
-        n_q = self.n_memory_tokens + 1
+        n_q = self.n_memory_tokens + 2  # K memory + 1 confidence + 1 value
 
         # Expand queries for batch
         queries = self.queries.unsqueeze(0).expand(batch, -1, -1)
@@ -99,20 +104,24 @@ class MemoryExtractor(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, n_q, -1)
         extracted = self.o_proj(attn_out)
 
-        # Split: K memory vectors + 1 confidence vector
-        memory_raw = extracted[:, :self.n_memory_tokens, :]  # (batch, K, hidden)
-        confidence_vec = extracted[:, self.n_memory_tokens, :]  # (batch, hidden)
+        # Split: K memory + 1 confidence + 1 value
+        memory_raw = extracted[:, :self.n_memory_tokens, :]       # (batch, K, hidden)
+        confidence_vec = extracted[:, self.n_memory_tokens, :]     # (batch, hidden)
+        value_vec = extracted[:, self.n_memory_tokens + 1, :]      # (batch, hidden)
 
         # Transform memory through FFN
         memory = memory_raw + self.dropout(self.ffn(self.ln(memory_raw)))
 
-        # Priority per memory vector (learned importance for eviction)
-        priority = torch.sigmoid(self.priority_proj(memory)).squeeze(-1)  # (batch, K)
+        # Priority per memory vector
+        priority = torch.sigmoid(self.priority_proj(memory)).squeeze(-1)
 
-        # Confidence scalar from confidence query
+        # Confidence (halt)
         confidence = torch.sigmoid(self.halt_proj(confidence_vec)).squeeze(-1)
 
-        return memory, priority, confidence
+        # Value (expected future reward)
+        value = self.value_proj(value_vec).squeeze(-1)  # unbounded scalar
+
+        return memory, priority, confidence, value
 
 
 class MemoryBuffer:
@@ -384,7 +393,7 @@ class RecurrentMemoryTransformer(nn.Module):
             hidden = self._forward_with_memory(input_ids, visible_memory)
 
             # Extract (overwrites previous extraction — settling refines)
-            extracted_memory, priority, confidence = self.extractor(hidden)
+            extracted_memory, priority, confidence, value = self.extractor(hidden)
             current_extraction = (extracted_memory, priority)
 
             actual_passes += 1
@@ -438,6 +447,7 @@ class RecurrentMemoryTransformer(nn.Module):
                 "n_passes": actual_passes,
                 "confidences": all_confidences,
                 "memory_used": self.memory_buffer.n_stored,
+                "value": value.item() if isinstance(value, torch.Tensor) else 0.0,
             }
         return logits, loss
 
