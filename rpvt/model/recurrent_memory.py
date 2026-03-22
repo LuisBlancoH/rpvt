@@ -121,7 +121,7 @@ class MemoryExtractor(nn.Module):
         # Value (expected future reward)
         value = self.value_proj(value_vec).squeeze(-1)  # unbounded scalar
 
-        return memory, priority, confidence, value
+        return memory, priority, confidence, value, value_vec
 
 
 class MemoryBuffer:
@@ -379,13 +379,20 @@ class RecurrentMemoryTransformer(nn.Module):
             if current_extraction is not None and persistent_memory is not None:
                 ext = current_extraction[0].detach()
                 if ext.dim() == 3:
-                    ext = ext.squeeze(0)  # (batch, K, hidden) → (K, hidden)
-                visible_memory = torch.cat([persistent_memory, ext], dim=0)
+                    ext = ext.squeeze(0)
+                # Include value vector so model can see its own value estimate
+                val_vec = current_extraction[2].detach()  # value vector (hidden_size)
+                if val_vec.dim() == 1:
+                    val_vec = val_vec.unsqueeze(0)  # (1, hidden)
+                visible_memory = torch.cat([persistent_memory, ext, val_vec], dim=0)
             elif current_extraction is not None:
                 ext = current_extraction[0].detach()
                 if ext.dim() == 3:
                     ext = ext.squeeze(0)
-                visible_memory = ext
+                val_vec = current_extraction[2].detach()
+                if val_vec.dim() == 1:
+                    val_vec = val_vec.unsqueeze(0)
+                visible_memory = torch.cat([ext, val_vec], dim=0)
             else:
                 visible_memory = persistent_memory  # None or (n, hidden)
 
@@ -393,8 +400,8 @@ class RecurrentMemoryTransformer(nn.Module):
             hidden = self._forward_with_memory(input_ids, visible_memory)
 
             # Extract (overwrites previous extraction — settling refines)
-            extracted_memory, priority, confidence, value = self.extractor(hidden)
-            current_extraction = (extracted_memory, priority)
+            extracted_memory, priority, confidence, value, value_vec = self.extractor(hidden)
+            current_extraction = (extracted_memory, priority, value_vec)
 
             actual_passes += 1
 
@@ -423,7 +430,7 @@ class RecurrentMemoryTransformer(nn.Module):
 
         # Store ONLY the final extraction in persistent buffer
         if current_extraction is not None:
-            final_memory, final_priority = current_extraction
+            final_memory, final_priority, _ = current_extraction
             self.memory_buffer.store(final_memory, final_priority)
 
         logits = accumulated_logits
