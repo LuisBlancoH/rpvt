@@ -2,221 +2,207 @@
 
 ## What It Is
 
-A frozen Qwen 0.5B transformer wrapped with memory + recurrence. The transformer adapts via LoRA on all layers. Two mechanisms do everything: **attention** (retrieval) and **FFN** (representation).
+A frozen Qwen transformer wrapped with memory, recurrence, and three deep control tokens. The transformer adapts via LoRA on all layers. Two core mechanisms do everything: **attention** (retrieval) and **FFN** (representation).
 
-23.5M trainable params. 494M frozen. Fits on a 3080 Ti in 1.1GB.
+28.7M trainable params. 494M frozen. Fits on a 3080 Ti.
 
 ## Architecture
 
 ```
-Input tokens
-    │
-    ▼
-┌── Embed (Qwen, frozen) ──────────────────────────────────────┐
-│                                                               │
-│   ┌─── Settling Loop (model decides when to stop) ────────┐  │
-│   │                                                        │  │
-│   │  Qwen Layer 1 (frozen + LoRA on all linear layers)     │  │
-│   │    Self-Attention → FFN                                │  │
-│   │    + memory cross-attention (2 heads, gated)           │  │
-│   │                                                        │  │
-│   │  Qwen Layer 2 ... same                                 │  │
-│   │  ...                                                   │  │
-│   │  Qwen Layer 24 ... same                                │  │
-│   │       │                                                │  │
-│   │       ▼                                                │  │
-│   │  Memory Extraction                                     │  │
-│   │    16 learned queries attend to output                 │  │
-│   │    → FFN transforms → 16 memory vectors               │  │
-│   │    → priority scores (learned importance)              │  │
-│   │    → confidence score (halt signal)                    │  │
-│   │       │                                                │  │
-│   │       ├── confident → stop, output logits              │  │
-│   │       └── not confident → loop (same input, new memory)│  │
-│   │                                                        │  │
-│   └── Only final extraction stored in persistent buffer ───┘  │
-│                                                               │
-│   LM Head → next token                                        │
-│                                                               │
-│   ◄── Memory Buffer (256 slots, priority-based eviction) ──►  │
-└───────────────────────────────────────────────────────────────┘
+Input: [value_token, confidence_token, manager_token, t₁, t₂, ..., tₙ]
+         ↓              ↓                ↓
+   ┌── 24 Qwen Layers (frozen + LoRA) ─────────────────────────────┐
+   │   Each layer:                                                  │
+   │     Self-Attention (all tokens attend to each other + memory)  │
+   │     FFN (process memory-augmented representations)             │
+   │     + memory cross-attention (2 heads, gated, to stored memory)│
+   └────────────────────────────────────────────────────────────────┘
+         ↓              ↓                ↓                ↓
+   value_hidden   conf_hidden    manager_hidden     output_hidden
+         ↓              ↓                ↓                ↓
+   MLP(value,action)  sigmoid       score each         LM head
+     → value          → halt        memory entry       → logits
+                                    → update priorities
+         ↓              ↓                ↓                ↓
+   ┌── After Halting ──────────────────────────────────────────────┐
+   │  1. Manager updates all memory priorities (deep re-evaluation)│
+   │  2. Extraction: 16 queries compress output → memory vectors   │
+   │  3. Store in persistent buffer with temporal encoding          │
+   └───────────────────────────────────────────────────────────────┘
 ```
 
-## Components
+## Control Tokens
 
-### 1. Qwen 0.5B (frozen base, 494M params)
-24 transformer layers. Self-attention + SwiGLU FFN. RoPE positions. Provides all language understanding. Never modified directly.
+Three learned tokens processed through ALL 24 transformer layers alongside the input. Each attends to input, memory, and each other. All decisions made with full depth.
 
-### 2. LoRA on all linear layers (4.4M params)
-Rank 8 adaptation on every linear layer in every block:
-- **Attention**: q_proj, k_proj, v_proj, o_proj — learn to attend to memory vectors
-- **FFN**: gate_proj, up_proj, down_proj — learn to process memory-augmented hidden states
+### Value Token
+- **Asks**: "Given my state and proposed action, how much reward do I expect?"
+- **Sees**: input (through self-attention) + memory (through cross-attention)
+- **Output**: `value = MLP([value_hidden, last_position_hidden])` → scalar
+- **Used for**: advantage estimation in RL, value-guided settling search
+- **During settling**: value stored in temporary memory → next pass sees "my value was 0.2, try better"
 
-The entire transformer adapts to work with memory. Without this, frozen attention patterns can't reach memory content and frozen FFNs can't process memory-augmented representations.
+### Confidence Token
+- **Asks**: "Am I confident enough to stop thinking?"
+- **Sees**: same as value — full depth of input + memory
+- **Output**: `confidence = sigmoid(linear(confidence_hidden))` → [0, 1]
+- **Used for**: halting decision (budget-weighted settling)
+- **During settling**: stored in temporary memory → next pass sees previous confidence
 
-### 3. Per-layer memory cross-attention (13.4M params)
-Each of the 24 layers has a small cross-attention (2 heads, head_dim=64):
-- Q from hidden states, K/V from memory vectors
-- Output projection zero-initialized (no-op at start)
-- Per-layer learned gate (sigmoid, starts at 0.5)
-- Gated residual: `x = x + gate × cross_attn(x, memory)`
+### Manager Token
+- **Asks**: "Given current context, how relevant is each stored memory entry?"
+- **Sees**: same as value/confidence — full depth
+- **Output**: per-entry priority scores via learned projections
+- **Used for**: memory management (what to keep, what to evict)
+- **When**: ONLY after halting. Manager thinks during settling but acts once at the end.
 
-The model's own attention (via LoRA) retrieves broadly. The cross-attention retrieves specifically from memory. Both are learned.
+## Memory System
 
-### 4. Memory Extractor (5.6M params)
-Runs once after all 24 layers. Compresses output into memory:
-
+### Writing (extraction)
+After all layers, 16 learned queries compress output into memory vectors:
 ```
-16 learned query vectors (896-dim each)
-    │
-    ▼ cross-attention to output hidden states
-    │
-    ▼ SwiGLU FFN (transforms into memory representation)
-    │
-    ├── 16 memory vectors (stored in buffer)
-    ├── 16 priority scores (for eviction)
-    └── 1 confidence score (for halting)
-```
-
-**Extraction queries** learn WHAT to compress. They attend to the full output and each produce one vector. Different queries learn to extract different things — entities, relationships, context, state.
-
-**FFN** transforms extracted vectors into a representation optimized for future retrieval, not for token prediction. Memory vectors don't need to look like hidden states.
-
-**Priority** scores determine eviction order. High priority = important, survives when buffer is full. Low priority = filler, evicted first.
-
-**Confidence** determines halting. Same mechanism as extraction — just one more query that asks "am I done?" Trained by the LM loss (no separate signal needed).
-
-### 5. Memory Buffer (0 params, just storage)
-FIFO when space available, priority-based eviction when full.
-
-- Max 256 entries (16 chunks of history)
-- Each entry: 896-dim vector + priority score
-- Settling: only final extraction stored (intermediate passes overwrite)
-- Cross-chunk: accumulates (16 new entries per chunk)
-
-## How It Works
-
-### Single chunk (no settling)
-
-```
-Input: "Alice works at Acme Corp in Tokyo as an engineer"
-Memory: [vectors from previous chunks, if any]
-
-1. Embed tokens
-2. Run through 24 Qwen layers
-   - Each layer: self-attention + FFN (frozen + LoRA)
-   - Each layer: cross-attend to memory (if memory exists)
-3. Extract: 16 queries compress output → FFN → 16 memory vectors
-4. Store in buffer with priorities
-5. LM Head → logits → next token
+16 queries attend to output hidden states → cross-attention → FFN → 16 vectors
+Each vector gets a priority score (learned importance)
+Temporal step encoding added (sinusoidal, no learned params)
+Stored in persistent buffer
 ```
 
-### Multi-chunk (memory accumulates)
+### Storage (buffer)
+- FIFO when space available, priority-based eviction when full
+- Max 256 entries (16 per chunk = ~16 chunks of history)
+- Each entry has: vector (896-dim) + priority (scalar) + temporal encoding (baked in)
 
+### Reading (per-layer cross-attention)
+All 24 layers read from memory via cross-attention (2 heads each):
 ```
-Chunk 1: "Alice works at Acme Corp in Tokyo"
-  → process → extract → buffer: [16 Alice vectors]
-
-Chunk 2: "Bob joined Globex in Paris"
-  → process WITH chunk 1 memory → extract → buffer: [16 Alice, 16 Bob]
-
-Chunk 3: "Where does Alice work?"
-  → process WITH 32 memory vectors
-  → cross-attention retrieves Alice-related vectors
-  → generates "Acme Corp"
+Q = current hidden state
+K, V = stored memory entries
+output = gated residual: x = x + gate × cross_attn(x, memory)
 ```
+Gate is learned per layer (when to use memory at each depth).
 
-### Settling (model decides when to stop)
+### Priority Management (deep, model-driven)
+After halting, the manager token re-evaluates ALL stored entries:
+```
+manager_query = query_proj(manager_hidden)     ← 24 layers deep
+entry_key_i   = key_proj(memory_entry_i)       ← learned projection
+score_i       = sigmoid(query · key_i / √d)    ← per-entry relevance
+→ replaces priority for all entries
+```
+Model learns: "goals always high priority, filler always low, facts depend on context."
+
+### Temporal Encoding
+Sinusoidal step signal added to each vector at storage time:
+```
+signal = 0.1 × sin/cos(step × frequencies)
+```
+- No learned parameters, generalizes to any step count
+- Model can distinguish "stored 1 chunk ago" from "stored 10 chunks ago"
+- Enables ordering: "A then B" ≠ "B then A"
+- Only increments across chunks, NOT during settling
+
+## Settling (Adaptive Computation)
 
 ```
 Pass 1:
-  visible_memory = persistent buffer (from previous chunks)
-  → process → extract → confidence = 0.75
-  → logits₁ weighted by 0.75
-  → temporary extraction (for next pass)
+  [value, confidence, manager, input] + persistent memory → 24 layers
+  → value = 0.2 (low)    → confidence = 0.3 (not halting)
+  → extract temporary memory (model's current understanding)
+  → control states stored in temporary memory for next pass
 
 Pass 2:
-  visible_memory = persistent buffer + pass 1 extraction
-  → process (differently — memory changed) → extract → confidence = 0.25
-  → logits₂ weighted by 0.25
-  → budget spent → stop
+  [value, confidence, manager, input] + persistent + temporary memory
+  → value = 0.7 (better!) → confidence = 0.5
+  → model sees its own previous value/confidence
+  → refines understanding, different output
 
-Final logits = 0.75 × logits₁ + 0.25 × logits₂
-
-Only pass 2's extraction stored in persistent buffer.
+Pass 3:
+  → value = 0.9           → confidence = 0.7 → budget spent → HALT
+  → manager scores all entries → priorities updated
+  → final extraction stored permanently
 ```
 
-The model learns through the LM loss:
-- Easy input → high confidence on pass 1 → 1 pass (fast)
-- Hard input → spread confidence → 2-3 passes (thorough)
+Key properties:
+- Temporary memory overwrites each pass (settling refines, doesn't accumulate)
+- Only final extraction stored permanently
+- Control states visible during settling, not persisted across chunks
+- Step counter does NOT increment during settling (same temporal position)
 
-## What Memory Can Represent
+## Multi-Chunk Processing
 
-Memory vectors are 896-dim, passed through a learned FFN. They can encode anything:
+```
+Chunk 1: "Alice works at Acme in Tokyo"
+  → 24 layers → extract 16 vectors (step 0) → store
 
-| Content | Example |
-|---------|---------|
-| Facts | "Alice works at Acme" |
-| State | "I'm processing a QA task" |
-| Numbers | "running total is 42" |
-| Plans | "next step: check the database" |
-| Experience | "last action got reward 0.8" |
-| Context | "this is a science article" |
+Chunk 2: "Bob joined Globex in Paris"
+  → 24 layers + memory from chunk 1 → extract (step 1) → store
+  → manager re-scores chunk 1 entries (still relevant? → yes)
 
-The model decides what to store through training. Train on QA → learns to store facts. Train on math → learns to store intermediates. Train on agent tasks → learns to store plans and experience.
+Chunk 3: "Where does Alice work?"
+  → 24 layers + memory from chunks 1,2
+  → cross-attention retrieves Alice-Acme entries
+  → value token: "high value — I can answer this"
+  → generates "Acme Corp"
+  → manager re-scores: Alice entries = high priority, Bob = moderate
+```
+
+## RL Training
+
+### Supervised phase (demonstrations)
+Standard cross-entropy on QA, code, interactive task demonstrations.
+
+### RL phase (policy gradient with advantage)
+```
+action = model.generate(observation, temperature=0.7)
+reward = environment.evaluate(action)
+
+advantage = reward - value    (value from value token)
+policy_loss = -(advantage × log_prob(action))
+value_loss = (value - td_target)²
+
+Both losses train through the full model:
+  policy_loss → LoRA weights, extraction, memory cross-attention
+  value_loss → value token embedding, value MLP, LoRA
+```
+
+### Value-guided settling
+During settling, the model searches for high-value actions:
+```
+Pass 1: candidate A → value 0.2 → "not good enough"
+Pass 2: candidate B → value 0.7 → "better, but can I do more?"
+Pass 3: candidate C → value 0.9 → "good" → halt → commit to C
+```
 
 ## Parameter Budget
 
-| Component | Params | What it does |
-|-----------|--------|-------------|
-| Qwen base (frozen) | 494.0M | Language understanding |
-| LoRA (all linear, rank 8) | 4.4M | Adapt transformer to memory |
-| Memory cross-attention (×24) | 13.4M | Per-layer retrieval from memory |
-| Memory extractor | 5.6M | Compress output → memory vectors |
-| Gates + halt + priority | 0.1M | Control signals |
-| **Total trainable** | **23.5M** | |
-| **Total model** | **517.5M** | |
-
-## What's Designed vs Learned
-
-| Designed (structure) | Learned (policy) |
-|---------------------|-----------------|
-| Memory as extra KV pairs | What to extract (queries) |
-| Cross-attention per layer | What to retrieve (attention) |
-| Extraction with FFN | How to represent memory (FFN) |
-| Priority for eviction | What's important (priority scores) |
-| Confidence for halting | When to stop (confidence query) |
-| LoRA on all layers | How to process memory signals |
-| FIFO + priority buffer | Everything else |
-
-## Compared to Predictive Transformer
-
-| | Predictive Transformer | Recurrent Memory Transformer |
-|---|---|---|
-| Trainable params | 212M | 23.5M |
-| Mechanisms | 10+ (GRU, prediction, halt net, write gate, value head, reward net, goal state, state modulation...) | 2 (attention + FFN) |
-| Memory write | Gated pooling per block | Learned extraction queries |
-| State | Separate GRU (224-dim) | Encoded in memory vectors |
-| Halting | Separate halt network from prediction errors | Confidence extraction query |
-| QA accuracy (15 epochs) | 68% | TBD |
-
-## Future Capabilities (no architecture changes needed)
-
-| Capability | How | Training needed |
-|-----------|-----|-----------------|
-| QA retrieval | Memory stores facts, attention retrieves | QA data (current) |
-| Multi-hop reasoning | Settling chains retrievals across passes | Multi-hop QA data |
-| Planning | Memory as scratchpad, settling as deliberation | Planning tasks |
-| RL / reward-seeking | Reward as input token, stored in memory | Agent loop + trajectories |
-| Continual learning | Online LoRA updates from experience | Agent loop |
-| Value estimation | One more extraction query | Agent loop + reward signal |
-
-The architecture is a general-purpose substrate. Training determines capability.
+| Component | Params | Purpose |
+|-----------|--------|---------|
+| Qwen 0.5B-Instruct (frozen) | 494.0M | Language understanding |
+| LoRA (all linear, rank 8) | 4.4M | Adapt to memory signals |
+| Memory cross-attention (×24) | 13.4M | Per-layer retrieval |
+| Memory extractor (queries+attn+FFN) | 5.6M | Compress → memory |
+| Value token + MLP | 1.8M | State+action → value |
+| Confidence token + proj | 0.9K | Halt decision |
+| Manager token + projections | 1.6M | Memory priority management |
+| Control token embeddings | 2.7K | 3 × 896 |
+| **Total trainable** | **~28.7M** | |
 
 ## Files
 
 | File | Contents |
 |------|----------|
 | `rpvt/model/recurrent_memory.py` | Full model implementation |
-| `rpvt/experiments/eval_suite.py` | Evaluation suite (QA, bAbI, LAMBADA, SQuAD, long-doc PPL) |
+| `rpvt/experiments/exp_v3_30_rmt_qa.py` | QA training (0.5B) |
+| `rpvt/experiments/exp_v3_32_agent.py` | Agent training (3B, all levels) |
+| `rpvt/experiments/exp_v3_33_agent_rl.py` | RL training with value/advantage |
+| `rpvt/experiments/eval_suite.py` | Evaluation across datasets |
 | `RECURRENT_MEMORY_TRANSFORMER.md` | This document |
+
+## Design Principles
+
+1. **Bitter lesson**: minimal structure, maximal learning. Two mechanisms (attention + FFN) everywhere.
+2. **Deep decisions**: all critical decisions (value, confidence, memory management) through full transformer depth via control tokens.
+3. **Model manages itself**: memory priorities updated by the model's own learned assessment, not prescribed rules.
+4. **Temporal awareness**: sinusoidal encoding gives ordering without learned parameters.
+5. **Settling = search**: multiple passes with value feedback enable candidate search.
+6. **Memory = state**: no separate GRU/goal — memory vectors carry everything.
