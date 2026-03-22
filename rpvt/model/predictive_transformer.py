@@ -119,7 +119,7 @@ class MemoryAttention(nn.Module):
         nn.init.zeros_(self.o_proj.weight)  # no-op at init
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, memory):
+    def forward(self, x, memory, head_scale=None):
         batch, seq_len, _ = x.shape
         n_mem = memory.shape[0]
         q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -127,12 +127,23 @@ class MemoryAttention(nn.Module):
         k = self.k_proj(mem).view(batch, n_mem, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(mem).view(batch, n_mem, self.num_heads, self.head_dim).transpose(1, 2)
         attn_out = F.scaled_dot_product_attention(q, k, v)
+        # State-dependent head scaling: amplify/suppress individual heads
+        if head_scale is not None:
+            # head_scale: (batch, n_heads) → (batch, n_heads, 1, 1)
+            attn_out = attn_out * head_scale.unsqueeze(-1).unsqueeze(-1)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         return self.dropout(self.o_proj(attn_out))
 
 
 class PredictiveBlock(nn.Module):
-    """Wraps an existing Qwen layer with new mechanisms."""
+    """Wraps an existing Qwen layer with new mechanisms.
+
+    The recurrent state acts as a BEHAVIOR CONTROLLER, not a memory.
+    It modulates HOW the block processes, not WHAT it knows:
+      - Memory gate: when to use retrieved memories
+      - Write gate: what to store
+      - (Halt network receives state at the model level)
+    """
 
     def __init__(self, qwen_layer, hidden_size, head_dim,
                  n_mem_heads=2, state_dim=224, goal_dim=64, dropout=0.1):
@@ -153,19 +164,42 @@ class PredictiveBlock(nn.Module):
 
         # Goal-biased memory queries
         self.goal_query_proj = nn.Linear(goal_dim, hidden_size, bias=False)
-        nn.init.zeros_(self.goal_query_proj.weight)  # no-op at init
+        nn.init.zeros_(self.goal_query_proj.weight)
 
         # Memory integration FFN
         self.ln_mem_ffn = RMSNorm(hidden_size)
         self.mem_ffn = SwiGLUFFN(hidden_size, hidden_size * 2)
         nn.init.normal_(self.mem_ffn.down_proj.weight, std=0.001)
 
-        # State (GRU with attention pooling)
+        # State (GRU with attention pooling) — UNIFIED BEHAVIOR CONTROLLER
+        # Sees: hidden states (content) + prediction error vector (what was surprising)
         self.state_query = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        self.state_compress = nn.Linear(hidden_size, state_dim, bias=False)
+        # Input: pooled hidden (hidden_size) + error vector (hidden_size) → state_dim
+        # Error is a vector so the model learns WHAT was surprising, not just how much
+        self.state_compress = nn.Linear(hidden_size * 2, state_dim, bias=False)
         self.state_gru = nn.GRUCell(state_dim, state_dim)
-        self.state_proj = nn.Linear(state_dim, hidden_size, bias=False)
-        nn.init.zeros_(self.state_proj.weight)
+
+        # State influences processing through BOTH:
+        #   Additive: bias hidden states (what to focus on)
+        #   Multiplicative: modulate gates (how to process)
+        # All zero-init = no-op at start
+
+        # Additive injection: bias hidden states
+        self.state_inject = nn.Linear(state_dim, hidden_size, bias=False)
+        nn.init.zeros_(self.state_inject.weight)
+
+        # 1. Memory gate bias: state controls when to use retrieved memories
+        self.state_mem_bias = nn.Linear(state_dim, hidden_size, bias=False)
+        nn.init.zeros_(self.state_mem_bias.weight)
+
+        # 2. Write gate bias: state controls what to store
+        self.state_write_bias = nn.Linear(state_dim, 1, bias=False)
+        nn.init.zeros_(self.state_write_bias.weight)
+
+        # 3. Memory head scaling: state controls which heads are active
+        self.state_head_scale = nn.Linear(state_dim, n_mem_heads, bias=True)
+        nn.init.zeros_(self.state_head_scale.weight)
+        nn.init.zeros_(self.state_head_scale.bias)  # sigmoid(0)=0.5 = neutral
 
         # Prediction head
         self.predictor = nn.Sequential(
@@ -174,7 +208,7 @@ class PredictiveBlock(nn.Module):
         )
         nn.init.normal_(self.predictor[1].weight, std=0.01)
 
-        # Write gate (novelty-aware)
+        # Write gate (novelty-aware, state-modulated)
         self.write_gate = nn.Linear(hidden_size * 2, 1, bias=True)
         nn.init.zeros_(self.write_gate.weight)
         nn.init.constant_(self.write_gate.bias, 0.0)
@@ -182,12 +216,12 @@ class PredictiveBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, state, memory_slots, position_embeddings=None,
-                goal_state=None):
+                goal_state=None, prev_block_output=None):
         batch_size = x.shape[0]
 
-        # State injection
+        # Additive state injection: bias hidden states toward state-relevant content
         if state is not None:
-            x = x + self.state_proj(state).unsqueeze(1)
+            x = x + self.state_inject(state).unsqueeze(1)
 
         # Run the ORIGINAL Qwen layer (self-attn + FFN)
         qwen_kwargs = {}
@@ -209,39 +243,70 @@ class PredictiveBlock(nn.Module):
                 outs.append(h)
             x = torch.cat(outs, dim=0)
 
-        # Memory attention (our addition)
+        # Compute state-dependent modulation signals
+        if state is not None:
+            mem_bias = self.state_mem_bias(state).unsqueeze(1)     # (batch, 1, hidden)
+            write_bias = self.state_write_bias(state)               # (batch, 1)
+            head_scale = torch.sigmoid(self.state_head_scale(state))  # (batch, n_heads)
+        else:
+            mem_bias = None
+            write_bias = None
+            head_scale = None
+
+        # Memory attention (state-modulated)
         mem_read = torch.zeros_like(x)
         if memory_slots is not None:
             h_mem = self.ln_mem(x)
-            # Bias queries with goal state (learned, starts as no-op)
+            # Bias queries with goal state
             if goal_state is not None:
                 h_mem = h_mem + self.goal_query_proj(goal_state).unsqueeze(1)
-            mem_out = self.mem_attn(h_mem, memory_slots)
+            mem_out = self.mem_attn(h_mem, memory_slots,
+                                    head_scale=head_scale)
             mem_read = mem_out
+
+            # Memory gate: state modulates when to use memory
             gate_input = torch.cat([x, mem_out], dim=-1)
-            mem_out = torch.sigmoid(self.mem_gate(gate_input)) * mem_out
+            gate = self.mem_gate(gate_input)
+            if mem_bias is not None:
+                gate = gate + mem_bias  # state shifts the gate
+            mem_out = torch.sigmoid(gate) * mem_out
+
             x = x + self.dropout(mem_out)
             h_int = self.ln_mem_ffn(x)
             x = x + self.dropout(self.mem_ffn(h_int))
 
-        # State update
+        # Prediction FIRST (so error feeds into state)
+        prediction = self.predictor(x)
+
+        # Compute prediction error VECTOR (what was surprising, not just how much)
+        if prev_block_output is not None:
+            # Mean-pool over sequence positions → (batch, hidden_size)
+            pred_error = (prev_block_output.detach() - prediction).mean(dim=1)
+        else:
+            pred_error = torch.zeros(batch_size, self.hidden_size,
+                                     device=x.device, dtype=x.dtype)
+
+        # State update: sees content (pooled hidden) + surprise vector (error)
         sq = self.state_query.to(dtype=x.dtype).expand(batch_size, -1, -1)
         scores = torch.bmm(sq, x.transpose(1, 2)) / math.sqrt(self.hidden_size)
         weights = F.softmax(scores, dim=-1)
-        pooled = torch.bmm(weights, x).squeeze(1)
-        state_input = self.state_compress(pooled)
+        pooled = torch.bmm(weights, x).squeeze(1)  # (batch, hidden_size)
+
+        # Unified input: content + surprise direction → compress → GRU
+        state_input = torch.cat([pooled, pred_error], dim=-1)  # (batch, hidden*2)
+        state_input = self.state_compress(state_input)  # (batch, state_dim)
         if state is None:
             state = torch.zeros(batch_size, self.state_dim,
                                 device=x.device, dtype=x.dtype)
         new_state = self.state_gru(state_input, state)
 
-        # Prediction
-        prediction = self.predictor(x)
-
-        # Write gate — per-position scores
+        # Write gate — state-modulated
         novelty = x - mem_read
         write_input = torch.cat([x, novelty], dim=-1)
-        write_scores = torch.sigmoid(self.write_gate(write_input)).squeeze(-1)
+        write_logits = self.write_gate(write_input)
+        if write_bias is not None:
+            write_logits = write_logits + write_bias.unsqueeze(1)  # state shifts write threshold
+        write_scores = torch.sigmoid(write_logits).squeeze(-1)
 
         return x, new_state, prediction, write_scores
 
@@ -290,9 +355,11 @@ class PredictiveTransformer(nn.Module):
         # Memory
         self.memory = MemoryBank(n_memory_slots, config.hidden_size)
 
-        # Halt network
+        # Halt network — receives prediction errors + state summary
+        # State modulates settling: "I've been wrong before" → settle more
+        halt_input_dim = self.n_layers + state_dim
         self.halt_net = nn.Sequential(
-            nn.Linear(self.n_layers, self.n_layers, bias=True),
+            nn.Linear(halt_input_dim, self.n_layers, bias=True),
             nn.SiLU(),
             nn.Linear(self.n_layers, 1, bias=True),
         )
@@ -487,10 +554,13 @@ class PredictiveTransformer(nn.Module):
             all_write_scores = []
 
             for i, block in enumerate(self.blocks):
+                # Pass previous block's output for prediction error
+                prev_out = hidden_states[i]  # h_{i-1} for block i
                 x, self._states[i], prediction, write_scores = block(
                     x, self._states[i], memory_slots,
                     position_embeddings=position_embeddings,
                     goal_state=self._goal_state,
+                    prev_block_output=prev_out,
                 )
                 hidden_states.append(x)
                 predictions.append(prediction)
@@ -509,8 +579,18 @@ class PredictiveTransformer(nn.Module):
             step_logits = self.lm_head(self.norm(x))
 
             if use_adaptive:
+                # Pool states for halt input (state modulates settling)
+                valid_states = [s for s in self._states if s is not None]
+                if valid_states:
+                    state_pool = torch.stack(valid_states).mean(dim=0)
+                    if state_pool.dim() > 1:
+                        state_pool = state_pool[0]
+                else:
+                    state_pool = torch.zeros(self.state_dim,
+                                             device=device, dtype=dtype)
+                halt_input = torch.cat([error_vec, state_pool]).unsqueeze(0)
                 halt_prob = torch.sigmoid(
-                    self.halt_net(error_vec.unsqueeze(0))
+                    self.halt_net(halt_input)
                 ).squeeze()
                 halt_prob = torch.min(halt_prob,
                     torch.tensor(halt_budget, device=device))
