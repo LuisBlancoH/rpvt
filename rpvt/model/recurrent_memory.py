@@ -297,10 +297,27 @@ class RecurrentMemoryTransformer(nn.Module):
             for _ in range(self.n_layers)
         ])
 
+        # Value token: processed through all 24 layers alongside input
+        # Gets deep understanding of state + memory before value estimation
+        self.value_token = nn.Parameter(
+            torch.randn(1, config.hidden_size) * 0.02
+        )
+        # Deep value MLP: value_token_hidden (state) + last_pos (action) → scalar
+        self.value_mlp = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size, config.hidden_size // 4, bias=True),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size // 4, 1, bias=True),
+        )
+        nn.init.zeros_(self.value_mlp[-1].weight)
+        nn.init.zeros_(self.value_mlp[-1].bias)
+
         # Cast new modules to bf16
         self.extractor.to(dtype=torch.bfloat16)
         self.mem_attns.to(dtype=torch.bfloat16)
-        # Note: value_net is inside extractor, already cast
+        self.value_token.data = self.value_token.data.to(dtype=torch.bfloat16)
+        self.value_mlp.to(dtype=torch.bfloat16)
 
         # Memory buffer
         self.memory_buffer = MemoryBuffer(
@@ -320,12 +337,24 @@ class RecurrentMemoryTransformer(nn.Module):
         self.memory_buffer.reset()
 
     def _forward_with_memory(self, input_ids, memory=None):
-        """Run Qwen layers with memory injected via cross-attention residual."""
+        """Run Qwen layers with memory + value token.
+
+        Value token is prepended and processed through all 24 layers.
+        It attends to input + memory, building deep state understanding.
+        Returns (output_hidden, value_hidden) where value_hidden is
+        the value token's final representation.
+        """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
         x = self.embed_tokens(input_ids)
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        # Prepend value token
+        vt = self.value_token.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, hidden)
+        x = torch.cat([vt, x], dim=1)  # (batch, 1+seq_len, hidden)
+
+        # Position IDs: value token gets position 0, input starts at 1
+        position_ids = torch.arange(seq_len + 1, device=device).unsqueeze(0)
         position_embeddings = self.rotary_emb(x, position_ids)
 
         for i, layer in enumerate(self.layers):
@@ -342,19 +371,23 @@ class RecurrentMemoryTransformer(nn.Module):
                 n_mem = memory.shape[0]
                 nh = self._mem_heads
                 hd = self._mem_head_dim
+                cur_len = x.shape[1]  # seq_len+1 (includes value token)
 
-                q = attn['q'](x).view(batch_size, seq_len, nh, hd).transpose(1, 2)
+                q = attn['q'](x).view(batch_size, cur_len, nh, hd).transpose(1, 2)
                 mem = memory.unsqueeze(0).expand(batch_size, -1, -1)
                 k = attn['k'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
                 v = attn['v'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
 
                 out = F.scaled_dot_product_attention(q, k, v)
-                out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+                out = out.transpose(1, 2).contiguous().view(batch_size, cur_len, -1)
                 out = attn['o'](out)
 
                 x = x + gate * out
 
-        return x
+        # Split: value token hidden state + rest
+        value_hidden = x[:, 0, :]      # (batch, hidden) — deep value state
+        output = x[:, 1:, :]           # (batch, seq_len, hidden) — normal output
+        return output, value_hidden
 
     def forward(self, input_ids, labels=None, n_passes=None,
                 return_info=False):
@@ -392,8 +425,8 @@ class RecurrentMemoryTransformer(nn.Module):
                 ext = current_extraction[0].detach()
                 if ext.dim() == 3:
                     ext = ext.squeeze(0)
-                # Include value vector so model can see its own value estimate
-                val_vec = current_extraction[2].detach()  # value vector (hidden_size)
+                # Include value token hidden state so model can see its own value
+                val_vec = current_extraction[2].detach()  # value token hidden (hidden_size)
                 if val_vec.dim() == 1:
                     val_vec = val_vec.unsqueeze(0)  # (1, hidden)
                 visible_memory = torch.cat([persistent_memory, ext, val_vec], dim=0)
@@ -408,12 +441,18 @@ class RecurrentMemoryTransformer(nn.Module):
             else:
                 visible_memory = persistent_memory  # None or (n, hidden)
 
-            # Forward through Qwen with visible memory
-            hidden = self._forward_with_memory(input_ids, visible_memory)
+            # Forward through Qwen with visible memory (value token processed alongside)
+            hidden, value_hidden = self._forward_with_memory(input_ids, visible_memory)
 
-            # Extract (overwrites previous extraction — settling refines)
-            extracted_memory, priority, confidence, value, value_vec = self.extractor(hidden)
-            current_extraction = (extracted_memory, priority, value_vec)
+            # Compute value: value token (deep state) + last position (action)
+            action_hidden = hidden[:, -1, :]
+            value_input = torch.cat([value_hidden, action_hidden], dim=-1)
+            value = self.value_mlp(value_input).squeeze(-1)
+
+            # Extract memory + priority + confidence
+            extracted_memory, priority, confidence, _, value_vec = self.extractor(hidden)
+            # Store value_vec from value token (richer than extraction query)
+            current_extraction = (extracted_memory, priority, value_hidden)
 
             actual_passes += 1
 
