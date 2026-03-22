@@ -217,7 +217,9 @@ class RecurrentMemoryTransformer(nn.Module):
             lora_config = LoraConfig(
                 r=lora_rank,
                 lora_alpha=lora_rank * 2,
-                target_modules=["q_proj", "v_proj"],
+                target_modules=["q_proj", "k_proj", "v_proj", "down_proj"],
+                # q,k,v: adapt attention to retrieve from memory
+                # down_proj: adapt FFN to process memory-augmented states
                 lora_dropout=dropout,
                 bias="none",
             )
