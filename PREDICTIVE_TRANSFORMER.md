@@ -2,15 +2,35 @@
 
 ## Overview
 
-The Predictive Transformer is a modified transformer architecture designed for brain-like processing. It keeps everything that works about transformers (attention, feedforward layers, residual connections, scaling) and adds five mechanisms the standard transformer lacks:
+The Predictive Transformer wraps a frozen pretrained transformer (Qwen 0.5B) with brain-inspired mechanisms. The base model's weights never change — all learning happens in the new components.
 
-1. **Recurrent state** — persistent memory across inputs (attention-pooled GRU per block)
-2. **Shared memory bank** — read/write episodic memory (all blocks read, top blocks write)
-3. **Predictive coding** — each block predicts the previous block's output (top-down)
-4. **Adaptive settling** — variable compute depth based on learned confidence
-5. **Fully learned gating** — no hardcoded thresholds anywhere
+**Design principles:**
+1. Everything learned, nothing hardcoded (bitter lesson)
+2. New mechanisms start as no-ops — model is exactly Qwen at step 0
+3. Base model = cortex (slow, stable knowledge), new mechanisms = hippocampus (fast, adaptive)
+4. Architecture provides structure, learning provides policy
 
-**Everything is learned. Nothing is hardcoded.**
+## What's New vs What's Qwen
+
+```
+QWEN (frozen, 494M params):          NEW MECHANISMS (trainable, 203M params):
+─────────────────────────            ──────────────────────────────────────
+Token embeddings                     Memory attention (2 heads per block)
+24 self-attention layers             Memory gate (input-aware, per block)
+24 SwiGLU FFN layers                 Memory integration FFN (per block)
+RoPE position embeddings             GRU state (persistent, per block)
+RMSNorm layers                       State injection (per block)
+LM head                              Attention pooling (per block)
+                                     Prediction head (per block)
+                                     Write gate (novelty-aware, per block)
+                                     Goal query projection (per block)
+                                     ──────────────────────────
+                                     Shared memory bank (64 slots)
+                                     Halt network
+                                     Value head
+                                     Reward network
+                                     Goal state GRU
+```
 
 ## Architecture Diagram
 
@@ -18,256 +38,332 @@ The Predictive Transformer is a modified transformer architecture designed for b
 Input tokens: [t₁, t₂, ..., tₙ]
     │
     ▼
-┌── Token Embedding + Position Embedding ────────────────────────────┐
-│                                                                     │
-│   ┌───────────── Adaptive Settling Loop ────────────────────┐      │
-│   │  Repeat until halt network says "confident enough"       │      │
-│   │  (easy inputs: 1 pass, hard inputs: up to 5 passes)     │      │
-│   │                                                          │      │
-│   │  ┌── PredictiveBlock ──────────────────────────────┐    │      │
-│   │  │                                                  │    │      │
-│   │  │  ① input + state_context (from GRU)             │    │      │
-│   │  │       │                                          │    │      │
-│   │  │  ② Self-Attention (8 heads)                     │    │      │
-│   │  │       │  (what's in the current input?)          │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ③ Main FFN (4x expansion)                      │    │      │
-│   │  │       │  (understand/process it)                 │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ④ Memory Attention (4 heads)                   │    │      │
-│   │  │       │  (retrieve relevant memories)            │    │      │
-│   │  │       │  gate = learned(input, memory_content)   │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ⑤ Memory Integration FFN (2x expansion)       │    │      │
-│   │  │       │  (combine understanding + memories)      │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ⑥ State Update                                 │    │      │
-│   │  │       │  attention_pool → GRU → new state       │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ⑦ Prediction Head                              │    │      │
-│   │  │       │  (predict previous block's output)       │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  ⑧ Write Gate (novelty-aware)                   │    │      │
-│   │  │       │  gate = learned(hidden, hidden-mem_read) │    │      │
-│   │  │       ▼                                          │    │      │
-│   │  │  output                                          │    │      │
-│   │  └──────────────────────────────────────────────────┘    │      │
-│   │       │                                                  │      │
-│   │       ▼ × 6 blocks                                      │      │
-│   │                                                          │      │
-│   │  Compute prediction errors → Halt Network               │      │
-│   │  errors = [‖actual - predicted‖ per block]              │      │
-│   │  halt_prob = sigmoid(MLP(errors))                        │      │
-│   │  logits += halt_prob × step_logits                       │      │
-│   │  if confident → stop; else → reset x, keep states       │      │
-│   │                                                          │      │
-│   │  Top 2 blocks write to memory (novelty-gated)           │      │
-│   └──────────────────────────────────────────────────────────┘      │
-│                                                                     │
-│   LayerNorm → LM Head → logits                                     │
-│                                                                     │
-│   ◄─────── Shared Memory Bank (64 slots) ───────────────────►     │
-│   Written by top 2 blocks. Read by all blocks.                      │
-│   Eviction: weakest slot replaced when full.                        │
-└─────────────────────────────────────────────────────────────────────┘
+┌── Token Embedding (Qwen, frozen) ─────────────────────────────────────┐
+│                                                                        │
+│   ┌───────────── Adaptive Settling Loop ────────────────────────┐     │
+│   │  Repeat until halt network says "confident enough"           │     │
+│   │  max_settle: 1→2→3→5 over training (curriculum)             │     │
+│   │                                                              │     │
+│   │  ┌── PredictiveBlock (×24) ──────────────────────────────┐  │     │
+│   │  │                                                        │  │     │
+│   │  │  ① State injection (from GRU, starts as zero)         │  │     │
+│   │  │  ② Qwen self-attention + FFN (frozen, untouched)      │  │     │
+│   │  │  ③ Memory attention (goal-biased queries)             │  │     │
+│   │  │  ④ Memory gate (input-aware: sigmoid(W·[x, mem]))    │  │     │
+│   │  │  ⑤ Memory FFN (integrate memory with understanding)   │  │     │
+│   │  │  ⑥ Attention pooling → GRU state update               │  │     │
+│   │  │  ⑦ Prediction head (predicts prev block's output)     │  │     │
+│   │  │  ⑧ Write gate (novelty-aware gated pooling)           │  │     │
+│   │  │                                                        │  │     │
+│   │  └────────────────────────────────────────────────────────┘  │     │
+│   │                                                              │     │
+│   │  Prediction errors → Halt Network → stop or settle again    │     │
+│   │  Top 2 blocks write gated-pooled vectors to memory          │     │
+│   │  Prediction errors + TD error → Goal state update           │     │
+│   └──────────────────────────────────────────────────────────────┘     │
+│                                                                        │
+│   RMSNorm → LM Head → logits → next token                            │
+│   Prediction errors + GRU states → Value Head → state value           │
+│   Error dynamics (prev + current) → Reward Network → intrinsic reward │
+│                                                                        │
+│   ◄──────── Shared Memory Bank (64 slots, strength-based eviction) ──►│
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Block Flow (Step by Step)
 
-```
-① State injection:     x = x + project(GRU_state)
-② Self-attention:      x = x + SelfAttn(x, x, x)
-③ Main FFN:            x = x + FFN_main(x)             ← understand before retrieving
-④ Memory attention:    mem = MemAttn(x, memory, memory)
-                       gate = sigmoid(W · [x, mem])      ← input-aware gating
-                       x = x + gate * mem
-⑤ Memory FFN:          x = x + FFN_mem(x)               ← integrate memory with understanding
-⑥ State update:        q = learned_query
-                       pooled = Attn(q, x, x)            ← attention pooling (not mean)
-                       state = GRU(compress(pooled), old_state)
-⑦ Prediction:          pred = Linear(LayerNorm(x))       ← predict prev block's output
-⑧ Write gate:          novelty = x - mem_read
-                       strength = sigmoid(W · [x, novelty])  ← novelty-aware
-```
-
-## Component Details
-
-### 1. Self-Attention (8 heads) — Standard
-
-Each position gathers information from every other position via learned Q/K/V projections. Causal mask prevents attending to future tokens. Each head learns a different type of relevance.
-
-### 2. Main FFN (4x expansion) — Understand Before Retrieving
+Each of the 24 PredictiveBlocks does this:
 
 ```
-x → Linear(768→3072) → SiLU → Linear(3072→768) → x
+① State injection:
+   x = x + state_proj(GRU_state)
+   state_proj initialized to zeros → no-op at step 0
+
+② Qwen layer (FROZEN):
+   x = QwenLayer(x)  — self-attention + SwiGLU FFN, exact original forward pass
+   This is where language understanding happens. We never touch it.
+
+③ Memory attention (2 heads):
+   queries = W_q · x + W_goal · goal_state    ← goal biases retrieval
+   keys    = W_k · memory_slots
+   values  = W_v · memory_slots
+   mem_out = CrossAttention(queries, keys, values)
+   o_proj initialized to zeros → output is zero at step 0
+
+④ Memory gate (input-aware):
+   gate = sigmoid(W · [x, mem_out])
+   x = x + gate * mem_out
+   W initialized to zeros → gate = 0.5, but mem_out = 0 at init → no effect
+
+⑤ Memory FFN (SwiGLU, 2× expansion):
+   x = x + MemFFN(x)
+   down_proj initialized with std=0.001 → near-zero output at init
+
+⑥ State update:
+   query = learned_parameter                    ← what positions matter?
+   pooled = attention(query, x, x)              ← weighted summary of sequence
+   compressed = W_compress · pooled             ← project to state_dim (224)
+   new_state = GRU(compressed, old_state)       ← update persistent state
+
+⑦ Prediction:
+   prediction = W · RMSNorm(x)                  ← predict prev block's output
+   error = ‖actual_prev_output - prediction‖    ← feeds halt network
+
+⑧ Write gate:
+   novelty = x - mem_read                       ← how different from stored?
+   write_scores = sigmoid(W · [x, novelty])     ← per-position importance
+   gated = write_scores * x                     ← gate positions (differentiable)
+   pooled_write = mean(gated)                   ← one vector per input
+   strength = mean(write_scores)                ← low if nothing matters → evicted
 ```
 
-Placed BEFORE memory attention. The model needs to understand what it's looking at before it knows what to retrieve from memory. In the brain: you recognize the stimulus before searching episodic memory.
+## Settling (Adaptive Halting)
 
-### 3. Memory Attention (4 heads) — Retrieve Relevant Memories
-
-Same mechanism as self-attention, but keys/values come from the shared memory bank. Queries are the model's processed representation (post-FFN), so retrieval is based on understanding, not raw features.
-
-**Input-aware gate:**
-```
-gate = sigmoid(W · concat(input_hidden, memory_output))
-x = x + dropout(gate * memory_output)
-```
-
-The gate sees BOTH the input and the memory content. It learns context-dependent retrieval:
-- "Question about Alice + memory has Alice's facts" → gate opens
-- "Greeting + memory has facts" → gate stays closed
-- "Question + empty memory" → gate stays closed (prevents hallucination)
-
-### 4. Memory Integration FFN (2x expansion) — Combine Sources
+The model can run all 24 blocks **multiple times** on the same input. Between passes:
+- Input embeddings reset (same starting point)
+- GRU states persist (carry forward what was learned)
+- Memory persists (reads from what was written in previous passes)
 
 ```
-x → Linear(768→1536) → SiLU → Linear(1536→768) → x
+Pass 1:  embed → 24 blocks → logits₁     (states: fresh, memory: empty)
+Pass 2:  embed → 24 blocks → logits₂     (states: updated, memory: has pass 1)
+Pass 3:  embed → 24 blocks → logits₃     (states: refined, memory: richer)
+
+Each pass:
+  errors = prediction_errors_per_block       [e₁, ..., e₂₄]
+  halt_prob = sigmoid(MLP(errors))           how confident?
+  logits_final += halt_prob × logitsₙ        weighted contribution
+  budget -= halt_prob                        spend confidence
+  budget < 0.01 → stop
+
+Curriculum (during training):
+  Epochs 1-3:   max_settle = 1   (just learn language, no settling)
+  Epochs 4-6:   max_settle = 2   (learn to use memory from pass 1)
+  Epochs 7-8:   max_settle = 3   (deeper refinement)
+  Epochs 9-10:  max_settle = 5   (full settling)
 ```
 
-Smaller than the main FFN (2x vs 4x expansion). Its job is to nonlinearly integrate "what I understand" with "what I remembered." Without this, memory output is just linearly added — no opportunity to reconcile the two information sources.
+## Memory System
 
-### 5. GRU State — Persistent Recurrent Memory
+### Writing (gated pooling, differentiable)
 
-**Attention pooling** (learned, replaces mean pooling):
-```
-query = learned_parameter (1 × hidden_size)
-pooled = MultiHeadAttention(query, hidden_states, hidden_states)
-```
-The model learns WHICH positions carry the most important information for the persistent state. A filler word contributes less than a key fact.
-
-**GRU update:**
-```
-reset_gate  = σ(W_r · [input, old_state])   → what to forget
-update_gate = σ(W_u · [input, old_state])   → how much to change
-candidate   = tanh(W_c · [input, reset × old_state])
-new_state   = update × old_state + (1-update) × candidate
-```
-
-State persists across inputs AND across settling steps. It's the primary mechanism for carrying information between passes during settling.
-
-### 6. Prediction Head — Top-Down Predictive Coding
-
-Each block predicts what the previous block should have output. Prediction errors are computed but not injected — they serve as:
-- Auxiliary training loss (small weight: 0.001)
-- Input to the halt network (determines settling confidence)
-
-### 7. Novelty-Aware Write Gate — Learned Storage Decisions
+Top 2 blocks write one pooled vector per input:
 
 ```
-novelty = hidden_state - memory_read_output
-write_strength = sigmoid(Linear(concat(hidden_state, novelty)) + bias)
+For each position in the sequence:
+  write_score = sigmoid(W · [hidden, hidden - mem_read])
+     ↑ novelty signal: how different is this from what's already stored?
+
+gated_hidden = write_score × hidden        ← scale each position
+pooled_vector = mean(gated_hidden)          ← single vector
+strength = mean(write_scores)              ← eviction priority
+
+If all scores ≈ 0:  pooled ≈ zero, strength ≈ 0 → evicted immediately
+If some scores high: pooled focuses on those positions → persists
 ```
 
-The gate sees what's at this position AND how different it is from what's already in memory. The model learns context-dependent storage:
-- "Important fact not in memory" → high strength
-- "Important fact already stored" → low strength (novelty ≈ 0)
-- "Filler content" → low strength regardless of novelty
+Gradients flow through the gating (differentiable). The model learns what to focus on when writing.
 
-Different types of content get different effective thresholds — all learned, no hardcoded rules.
+### Storage (64 slots, strength-based eviction)
 
-### 8. Memory Bank — Shared with Learned Eviction
-
-- **Read:** All blocks, via their 4 memory attention heads
-- **Write:** Top 2 blocks only (high-level semantic representations)
-- **Eviction:** When full, weakest slot (lowest write strength) gets replaced — but only if the new content is stronger
-- **Write strength:** Continuous [0, 1], not binary — slots have varying importance
-
-### 9. Adaptive Settling — Learned Halting
-
-```python
-for step in range(max_settle):  # max 5
-    # Forward through all blocks
-    errors = prediction_errors_per_block  # [e₁, ..., e₆]
-    halt_prob = sigmoid(MLP(errors))      # learned confidence
-
-    logits += halt_prob × step_logits     # weighted accumulation
-    remaining_budget -= halt_prob
-
-    if remaining_budget < 0.01: break     # confident enough
+```
+Write: store pooled vector with strength score
+Full?  → replace weakest slot (if new entry is stronger)
+Update: TD error modulates all stored strengths
+         positive δ → strengthen all entries (things are going well)
+         negative δ → weaken all entries (things are going badly)
+         Over time: useful memories get stronger, useless ones get evicted
 ```
 
-The halt network learns from a ponder cost: more steps = higher penalty. The model discovers the minimum compute needed per input. Easy inputs settle in 1 pass. Ambiguous inputs get up to 5 passes.
+### Reading (cross-attention, goal-biased)
 
-## Training
+All 24 blocks read from memory via cross-attention:
 
-**Three losses:**
+```
+Query = W_q · hidden + W_goal · goal_state    ← what do I need? (biased by goal)
+Key   = W_k · memory_slots                    ← what's stored?
+Value = W_v · memory_slots                    ← stored content
 
-| Loss | Weight | Purpose |
-|---|---|---|
-| LM loss (cross-entropy) | 1.0 | Next-token prediction (primary) |
+Attention selects relevant memories. Gate decides how much to use:
+  gate = sigmoid(W · [hidden, mem_output])
+  output = gate × mem_output
+```
+
+### Multi-Chunk Training
+
+Memory persists across consecutive chunks within a training group:
+
+```
+Group of 4 chunks from same document:
+  chunk 1: "Alice works at Acme..."     → write to memory, backward, detach
+  chunk 2: "She moved to Tokyo..."      → read chunk 1's memory, write more, backward, detach
+  chunk 3: "Her colleague Bob..."       → read chunks 1-2, write more, backward, detach
+  chunk 4: "Where does Alice work?"     → read all, answer benefits from memory
+
+Memory and GRU states persist across chunks.
+Gradients are contained per-chunk (truncated BPTT).
+Memory resets between groups.
+```
+
+## Value / Reward / Goal System
+
+These components are designed for an **agent loop** but can pre-train on self-supervised signals.
+
+### Value Head
+
+```
+Input:  prediction_errors (24) + pooled_GRU_states (224) = 248-dim
+Output: scalar value estimate
+
+Training (Phase 1 — self-supervised):
+  value_target = -lm_loss   (lower loss = higher value)
+  value_loss = (V(state) - value_target)²
+
+Training (Phase 2 — agent loop):
+  TD learning: V(s) ← V(s) + α·(reward + γ·V(s') - V(s))
+```
+
+The value head learns: "what does a good internal state look like?" States with relevant memories and low prediction errors → high value.
+
+### Reward Network
+
+```
+Input:  [prev_prediction_errors, current_prediction_errors] = 48-dim
+Output: scalar intrinsic reward
+
+Learns what constitutes "progress" — not hardcoded.
+Maybe decreasing errors = good. Maybe certain blocks' errors matter more.
+The network discovers it.
+```
+
+### Goal State
+
+A slow-updating persistent vector that biases memory retrieval:
+
+```
+Input:  prediction_errors (24) + TD_error (1) = 25-dim
+GRU:    goal_gru(input, old_goal) → new_goal
+
+Update gate biased to 0.95 (changes slowly — persistent objective)
+Goal biases memory queries: Q = W_q·hidden + W_goal·goal
+```
+
+Without an agent loop, the goal state tracks "what kind of text am I processing" — shifts at topic boundaries, stable within a topic. With an agent loop, it tracks "what task am I solving."
+
+## Training Phases
+
+### Phase 1: Self-Supervised (current)
+
+Train on WikiText-2 with multi-chunk groups. Loss:
+
+| Component | Weight | Signal |
+|-----------|--------|--------|
+| LM loss (cross-entropy) | 1.0 | Next-token prediction |
 | Prediction error | 0.001 | Top-down predictions match reality |
-| Ponder cost | 0.01 | Penalize excessive settling steps |
+| Ponder cost | 0.01 | Penalize excessive settling |
+| Value loss | 0.01 | Value head predicts -lm_loss |
 
-**Settling during training:** 2/3 of batches use 1-pass, 1/3 use 2-pass.
+**What trains:** memory attention, write gate, prediction heads, halt network, value head, reward net, goal state. Memory FFN, state injection learn gradually.
 
-## Initialization
+**What doesn't train yet:** GRU state (no gradient until max_settle ≥ 2), goal-biased retrieval (goal state is noisy early), strength updates (TD signal is weak).
 
-All new mechanisms start as **no-ops** — the model begins as a standard transformer:
+### Phase 2: Document QA (planned)
+
+Synthetic QA with stored facts:
+```
+Passage: "Alice works at Acme Corp in Tokyo"
+Question: "Where does Alice work?"
+Reward: 1 if answer contains "Acme Corp", 0 otherwise
+```
+
+This gives real reward signal → TD learning → value head learns → goal state learns to focus on QA → memory strengths update based on usefulness.
+
+### Phase 3: Agent Loop (planned)
+
+Multi-step tasks with tool use:
+```
+Task → generate action → execute → observe result → reward
+  ↑                                                    │
+  └────── goal, memory, value guide next action ───────┘
+```
+
+External reward drives all motivation components. The architecture is ready — just needs the training loop.
+
+## Initialization (All No-Ops)
 
 | Component | Init | Effect at step 0 |
-|---|---|---|
-| `state_proj` | zeros | State doesn't affect output |
-| `mem_gate` | zeros | Memory contributes nothing |
-| `predictor` | std=0.01 | Near-zero predictions |
-| `write_gate.bias` | -2.0 | sigmoid(-2)≈0.12, mostly closed |
-| `halt_net.bias` | +1.0 | Biased toward halting early |
+|-----------|------|-------------------|
+| state_proj | zeros | GRU state doesn't affect output |
+| mem_attn.o_proj | zeros | Memory attention outputs zero |
+| mem_gate | zeros | Gate = 0.5, but mem output = 0 |
+| mem_ffn.down_proj | std=0.001 | Near-zero output |
+| predictor | std=0.01 | Small predictions |
+| write_gate | bias=0.0 | Neutral (sigmoid(0)=0.5) |
+| goal_query_proj | zeros | Goal doesn't bias queries |
+| value_head | zeros | Outputs 0 |
+| reward_net | zeros | Outputs 0 |
+| halt_net | bias=1.0 | Biased toward halting (sigmoid(1)≈0.73) |
+| goal_gru update gate | bias=3.0 | sigmoid(3)≈0.95, barely changes |
 
-Enables weight initialization from existing transformers (e.g., Qwen) — the model works identically to the base at step 0, then gradually learns to use the new mechanisms.
+## Capabilities
 
-## What's Learned vs What's Designed
-
-| Aspect | Status |
-|---|---|
-| What to store in memory | **Learned** (novelty-aware write gate) |
-| What to retrieve from memory | **Learned** (attention) |
-| How much to rely on memory | **Learned** (input-aware gate) |
-| What to evict from memory | **Learned** (weakest-strength eviction) |
-| When to stop thinking | **Learned** (halt network from errors) |
-| What GRU remembers | **Learned** (attention pooling) |
-| Block order / connections | Designed (Self-Attn → FFN → Mem-Attn → Mem-FFN) |
-| Number of heads split (8+4) | Designed |
-| Memory bank size (64) | Designed |
-| State dimension (256) | Designed |
-
-## Hyperparameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `hidden_size` | 768 | Hidden dimension |
-| `n_layers` | 6 | Number of PredictiveBlocks |
-| `n_self_heads` | 8 | Self-attention heads |
-| `n_mem_heads` | 4 | Memory attention heads |
-| `state_dim` | 256 | GRU state dimension |
-| `n_memory_slots` | 64 | Memory bank capacity |
-| `n_write_layers` | 2 | Top N blocks that write to memory |
-| `max_settle` | 5 | Maximum settling iterations |
-| `ffn_mult` | 4 | Main FFN expansion (memory FFN uses 2) |
-| `dropout` | 0.1 | Dropout rate |
-
-## Results
-
-**From-scratch training on WikiText-2 (v2, 10 epochs):**
-
-| Metric | Result |
-|---|---|
-| 1-pass perplexity | 330 |
-| 2-pass perplexity | **251** |
-| Settling gain | **+79 (24% improvement)** |
-| Prediction error | 45.8 → 20.2 (halved over training) |
-
-The model learns to use settling — 2-pass consistently beats 1-pass, and the gap grows every epoch. This proves the architecture works: the GRU state, memory, and predictions are genuinely useful on the second pass.
+| Capability | Mechanism | Trainable Now? |
+|------------|-----------|---------------|
+| Store facts across inputs | Memory bank + write gate | Yes (multi-chunk) |
+| Retrieve relevant facts | Memory attention + gate | Yes (multi-chunk) |
+| Track context over time | GRU state | Partially (needs settle ≥ 2) |
+| Think harder on hard inputs | Adaptive settling | Yes (curriculum) |
+| Detect surprise | Prediction heads + errors | Yes |
+| Decide what to store | Write gate (novelty-aware) | Yes |
+| Evaluate state quality | Value head | Yes (proxy: -lm_loss) |
+| Detect progress | Reward network | Yes (error dynamics) |
+| Maintain objectives | Goal state | Partially (needs agent loop) |
+| Reinforce useful memories | TD-modulated strengths | Partially (weak signal) |
 
 ## Files
 
-- `rpvt/model/predictive_transformer.py` — full model implementation
-- `rpvt/experiments/exp_v3_26_train_predictive.py` — training script
-- `PREDICTIVE_TRANSFORMER.md` — this document
+| File | Contents |
+|------|----------|
+| `rpvt/model/predictive_transformer.py` | Full model: PredictiveBlock, PredictiveTransformer, MemoryBank |
+| `rpvt/experiments/exp_v3_28_qwen_wrapped.py` | Training script with multi-chunk, debug logging |
+| `PREDICTIVE_TRANSFORMER.md` | This document |
+| `architecture_diagram.md` | Visual diagrams |
 
-## Future
+## Parameters
 
-1. **Qwen weight initialization** — copy self-attention, FFN, embeddings from Qwen; new mechanisms start as no-ops
-2. **Larger training** — OpenWebText or SlimPajama instead of WikiText-2
-3. **RoPE** — replace absolute position embeddings for length generalization
-4. **Memory across documents** — persistent memory across training sequences
-5. **Agent integration** — memory persists across tool calls and actions
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Base model | Qwen2.5-0.5B | 24 layers, hidden=896, 14 heads |
+| Frozen params | 494M | All Qwen weights |
+| Trainable params | 203M | All new mechanisms |
+| Memory slots | 64 | Shared bank capacity |
+| Memory heads | 2 | Per-block cross-attention heads |
+| State dim | 224 | GRU hidden dimension |
+| Goal dim | 64 | Goal state dimension |
+| Write layers | 2 | Top N blocks that write |
+| Max settle | 5 | Maximum settling iterations |
+| Memory FFN | 2× expansion | SwiGLU |
+| Dropout | 0.1 | On memory attention and FFN |
+
+## Brain Analogy
+
+```
+Brain                    │  Predictive Transformer
+─────────────────────────┼───────────────────────────────
+Cortical column          │  PredictiveBlock (×24)
+Feedforward path         │  Qwen self-attention + FFN (frozen)
+Feedback path            │  Prediction head (top-down)
+Prediction error         │  ‖actual - predicted‖
+Neural settling          │  Adaptive settling loop
+Working memory (PFC)     │  GRU state (per block, dim=224)
+Hippocampus              │  Shared memory bank (64 slots)
+Encoding gate            │  Novelty-aware write gate
+Pattern completion       │  Memory attention (retrieval)
+Novelty detection        │  hidden - mem_read signal
+Consolidation            │  Strength-based eviction + TD updates
+Top-down attention       │  Input-aware memory gate
+Dopamine / reward        │  TD error from value head
+Intrinsic motivation     │  Learned reward network
+Goal maintenance (PFC)   │  Goal state GRU (slow-updating)
+Value judgment            │  Value head
+```

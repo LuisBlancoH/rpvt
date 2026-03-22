@@ -1,11 +1,11 @@
-# Predictive Transformer — Architecture Diagram
+# Predictive Transformer — Architecture Diagrams
 
 ## Full System
 
 ```
                             ┌─────────────────────────┐
                             │   Shared Memory Bank     │
-                            │   64 slots × 768 dim     │
+                            │   64 slots × 896 dim     │
                             │                          │
                             │  ┌───┬───┬───┬───┬───┐  │
                             │  │ s₁│ s₂│ s₃│...│s₆₄│  │
@@ -13,184 +13,137 @@
                             │  strength: [0.8, 0.3, …] │
                             │                          │
                             │  write: top 2 blocks     │
-                            │  read:  all blocks       │
+                            │  read:  all 24 blocks    │
                             │  evict: weakest slot     │
+                            │  update: TD error        │
                             └────▲──────────┬──────────┘
                                  │          │
                           write  │          │ read
-                       (novelty- │          │ (attention)
-                        gated)   │          │
+                       (gated    │          │ (goal-biased
+                        pooling) │          │  attention)
                                  │          │
  ┌───────────────────────────────┴──────────┴───────────────────────────┐
  │                                                                      │
- │  Input tokens ──► Embed + PosEmbed ──► x                            │
+ │  Input tokens ──► Embed (Qwen, frozen) ──► x                       │
  │                                                                      │
  │  ┌─── Adaptive Settling Loop ─────────────────────────────────────┐ │
- │  │                                                                 │ │
- │  │   ┌── Block 1 ──┐  ┌── Block 2 ──┐       ┌── Block 6 ──┐    │ │
- │  │   │  state₁ GRU  │  │  state₂ GRU  │  ...  │  state₆ GRU  │    │ │
- │  │   │              │  │              │       │              │    │ │
- │  │   │ ①Self-Attn   │  │ ①Self-Attn   │       │ ①Self-Attn   │    │ │
- │  │   │ ②FFN         │→│ ②FFN         │→ … →│ ②FFN         │    │ │
- │  │   │ ③Mem-Attn    │  │ ③Mem-Attn    │       │ ③Mem-Attn    │    │ │
- │  │   │ ④Mem-FFN     │  │ ④Mem-FFN     │       │ ④Mem-FFN     │    │ │
- │  │   │ ⑤State+Pred  │  │ ⑤State+Pred  │       │ ⑤State+Pred  │    │ │
- │  │   │ ⑥Write Gate  │  │ ⑥Write Gate  │       │ ⑥Write Gate  │    │ │
- │  │   └──────────────┘  └──────────────┘       └──────┬───────┘    │ │
- │  │                                                     │           │ │
- │  │   Prediction errors: [e₁, e₂, e₃, e₄, e₅, e₆] ◄──┘           │ │
- │  │          │                                                      │ │
- │  │          ▼                                                      │ │
- │  │   ┌── Halt Network ─────────────┐                              │ │
- │  │   │  halt = σ(MLP(errors))      │                              │ │
- │  │   │  confident? → stop          │                              │ │
- │  │   │  uncertain? → settle again  │                              │ │
- │  │   └─────────────────────────────┘                              │ │
- │  └─────────────────────────────────────────────────────────────────┘ │
+ │  │  max_settle: 1→2→3→5 (curriculum)                               │ │
+ │  │                                                                  │ │
+ │  │  ┌─── PredictiveBlock (×24) ──────────────────────────────┐    │ │
+ │  │  │                                                         │    │ │
+ │  │  │  ① State injection   x = x + proj(GRU_state)          │    │ │
+ │  │  │  ② Qwen layer        x = SelfAttn + SwiGLU (frozen)   │    │ │
+ │  │  │  ③ Memory attention  mem = CrossAttn(x+goal, memory)  │    │ │
+ │  │  │  ④ Memory gate       x = x + sigmoid(W·[x,mem])·mem   │    │ │
+ │  │  │  ⑤ Memory FFN        x = x + MemFFN(x)                │    │ │
+ │  │  │  ⑥ State update      pool → compress → GRU → state    │    │ │
+ │  │  │  ⑦ Prediction        pred = W·RMSNorm(x) → error      │    │ │
+ │  │  │  ⑧ Write gate        scores·x → pool → memory.write   │    │ │
+ │  │  │                                                         │    │ │
+ │  │  └─────────────────────────────────────────────────────────┘    │ │
+ │  │                                                                  │ │
+ │  │  errors = [e₁, ..., e₂₄] ──► Halt Network ──► stop/continue   │ │
+ │  │                                                                  │ │
+ │  │  logits_final = Σ (halt_prob × step_logits)                     │ │
+ │  └──────────────────────────────────────────────────────────────────┘ │
  │                                                                      │
- │  LayerNorm ──► LM Head ──► logits ──► next token                    │
+ │  ┌─── Output Heads ─────────────────────────────────────────────┐   │
+ │  │                                                               │   │
+ │  │  RMSNorm → LM Head → next token logits                      │   │
+ │  │                                                               │   │
+ │  │  errors + GRU states → Value Head → "how good is my state?" │   │
+ │  │                                                               │   │
+ │  │  [prev_errors, errors] → Reward Net → intrinsic reward      │   │
+ │  │                                                               │   │
+ │  │  errors + TD error → Goal GRU → updated goal state          │   │
+ │  │                                                               │   │
+ │  └───────────────────────────────────────────────────────────────┘   │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-## Single PredictiveBlock (detailed)
+## Single PredictiveBlock
 
 ```
- input   state                    memory bank
-   │       │                          │
-   ▼       ▼                          │
- ┌─────────────────┐                  │
- │  x = x + W·state│  ← state        │
- │    (context)     │    injection     │
- └────────┬────────┘                  │
-          │                           │
-          ▼                           │
- ┌────────────────────────┐           │
- │  ① SELF-ATTENTION      │           │
- │  8 heads               │           │
- │                        │           │
- │  Q ← x  (what am I    │           │
- │          looking for?) │           │
- │  K ← x  (what does    │           │
- │          each pos      │           │
- │          contain?)     │           │
- │  V ← x  (info to      │           │
- │          gather)       │           │
- │                        │           │
- │  causal mask applied   │           │
- │  x = x + attn_out      │           │
- └────────┬───────────────┘           │
-          │                           │
-          ▼                           │
- ┌────────────────────────┐           │
- │  ② MAIN FFN            │           │
- │  768 → 3072 → 768      │           │
- │  (4x expansion)        │           │
- │                        │           │
- │  Understand input      │           │
- │  BEFORE retrieving     │           │
- │  from memory           │           │
- │                        │           │
- │  x = x + FFN(x)        │           │
- └────────┬───────────────┘           │
-          │                           │
-          ▼                           ▼
- ┌──────────────────────────────────────┐
- │  ③ MEMORY ATTENTION                  │
- │  4 heads                             │
- │                                      │
- │  Q ← x       (what do I need?)      │
- │  K ← memory  (what's stored?)       │
- │  V ← memory  (stored info)          │
- │                                      │
- │  mem_out = Attention(Q, K_mem, V_mem)│
- │                                      │
- │  ┌────────────────────────────────┐ │
- │  │  INPUT-AWARE GATE              │ │
- │  │                                │ │
- │  │  gate = σ(W · [x, mem_out])    │ │
- │  │                                │ │
- │  │  sees BOTH:                    │ │
- │  │   • what I'm processing (x)   │ │
- │  │   • what memory returned       │ │
- │  │                                │ │
- │  │  learns WHEN to use memory:    │ │
- │  │   question + relevant mem → ON │ │
- │  │   greeting + any mem → OFF     │ │
- │  │   question + empty mem → OFF   │ │
- │  └────────────────────────────────┘ │
- │                                      │
- │  x = x + gate * mem_out             │
- └────────┬─────────────────────────────┘
-          │
-          ▼
- ┌────────────────────────┐
- │  ④ MEMORY FFN           │
- │  768 → 1536 → 768      │
- │  (2x expansion)        │
- │                        │
- │  Integrate memory      │
- │  with understanding    │
- │  (nonlinear combine)   │
- │                        │
- │  x = x + MemFFN(x)     │
- └────────┬───────────────┘
-          │
-          ▼
- ┌────────────────────────────────────────────┐
- │  ⑤ STATE UPDATE                            │
- │                                            │
- │  ┌─────────────────────────────┐          │
- │  │  ATTENTION POOLING           │          │
- │  │  (learned, not mean pool)    │          │
- │  │                              │          │
- │  │  query = learned_param       │          │
- │  │  pooled = Attn(query, x, x)  │          │
- │  │  → focuses on important pos  │          │
- │  └──────────────┬──────────────┘          │
- │                  │                         │
- │                  ▼                         │
- │  ┌──────────────────────────────┐         │
- │  │  GRU                         │         │
- │  │                              │         │
- │  │  input = compress(pooled)    │         │
- │  │                              │         │
- │  │  reset  = σ(W·[in, old])    │         │
- │  │  update = σ(W·[in, old])    │         │
- │  │  cand   = tanh(W·[in,       │         │
- │  │              reset·old])     │         │
- │  │  new = update·old +          │         │
- │  │       (1-update)·cand        │         │
- │  │                              │  ──► new state
- │  │  Persists across inputs      │   (carries to
- │  │  AND settling steps          │    next input)
- │  └──────────────────────────────┘         │
- └────────┬───────────────────────────────────┘
-          │
-          ▼
- ┌────────────────────────────────────────────┐
- │  ⑥ PREDICTION + WRITE                      │
- │                                            │
- │  ┌─────────────────────┐   ┌────────────┐│
- │  │ PREDICTION HEAD      │   │ WRITE GATE  ││
- │  │                      │   │             ││
- │  │ pred = LN(x) → W·x  │   │ novelty =   ││
- │  │                      │   │  x - mem_rd ││
- │  │ predicts block (i-1) │   │             ││
- │  │ output (top-down)    │   │ strength =  ││
- │  │                      │   │  σ(W·[x,    ││
- │  │ error = ‖actual -    │   │    novelty])││
- │  │          predicted‖  │   │             ││
- │  │                      │   │ high if new ││
- │  │ → feeds halt network │   │ low if known││
- │  └─────────────────────┘   └─────┬──────┘│
- │                                   │       │
- │                            (top 2 blocks  │
- │                             write to      │
- │                             memory bank)  │
- └────────┬──────────────────────────────────┘
-          │
-          ▼
-       output → next block
+ input   state   goal                 memory bank
+   │       │       │                      │
+   ▼       ▼       │                      │
+ ┌─────────────┐   │                      │
+ │ x += proj(  │   │                      │
+ │   state)    │   │                      │
+ │ (no-op@init)│   │                      │
+ └──────┬──────┘   │                      │
+        │          │                      │
+        ▼          │                      │
+ ┌──────────────┐  │                      │
+ │ QWEN LAYER   │  │                      │
+ │ (frozen)     │  │                      │
+ │              │  │                      │
+ │ self-attn    │  │                      │
+ │ + SwiGLU FFN │  │                      │
+ │              │  │                      │
+ │ 896-dim      │  │                      │
+ └──────┬───────┘  │                      │
+        │          │                      │
+        ▼          ▼                      ▼
+ ┌───────────────────────────────────────────┐
+ │  MEMORY ATTENTION (2 heads)               │
+ │                                           │
+ │  Q = W_q·x + W_goal·goal  ← goal biases │
+ │  K = W_k·memory                          │
+ │  V = W_v·memory                          │
+ │  mem_out = Attn(Q, K, V)                 │
+ │  (o_proj=zeros@init → output=0)          │
+ │                                           │
+ │  GATE: g = σ(W·[x, mem_out])            │
+ │  x = x + g·mem_out                       │
+ └──────┬────────────────────────────────────┘
+        │
+        ▼
+ ┌──────────────┐
+ │ MEMORY FFN   │
+ │ 896→1792→896 │
+ │ SwiGLU       │
+ │ (tiny@init)  │
+ └──────┬───────┘
+        │
+        ▼
+ ┌───────────────────────────────────────┐
+ │  STATE UPDATE                         │
+ │                                       │
+ │  query = learned_param                │
+ │  pooled = Attn(query, x, x)          │
+ │  compressed = W·pooled  (→224-dim)   │
+ │                                       │
+ │  GRU:                                │
+ │    reset  = σ(W·[in, old])           │
+ │    update = σ(W·[in, old])           │
+ │    cand   = tanh(W·[in, r·old])     │
+ │    new = u·old + (1-u)·cand          │
+ │                        ──► persists  │
+ └──────┬────────────────────────────────┘
+        │
+        ▼
+ ┌───────────────────────────────────────┐
+ │  PREDICTION + WRITE                   │
+ │                                       │
+ │  PREDICTION HEAD:                     │
+ │    pred = W·RMSNorm(x)               │
+ │    error = ‖prev_block_out - pred‖   │
+ │    → feeds halt network              │
+ │                                       │
+ │  WRITE GATE:                          │
+ │    novelty = x - mem_read             │
+ │    scores = σ(W·[x, novelty])        │
+ │    gated = scores·x                   │
+ │    pooled = mean(gated)  → to memory │
+ │    strength = mean(scores)            │
+ │                                       │
+ │    scores≈0 → weak write → evicted   │
+ │    scores↑  → focused write → persists│
+ └──────┬────────────────────────────────┘
+        │
+        ▼
+     output → next block
 ```
 
 ## Settling (Adaptive Halting)
@@ -199,83 +152,131 @@
   Pass 1                    Pass 2                    Pass 3
   ─────                    ─────                    ─────
 
-  embed ──► blocks         embed ──► blocks         embed ──► blocks
-  (states = init)          (states = updated)       (states = refined)
-  (memory = empty/prev)    (memory += pass 1)       (memory += pass 2)
+  embed ──► 24 blocks      embed ──► 24 blocks      embed ──► 24 blocks
+  state: fresh             state: updated            state: refined
+  memory: empty/prev       memory: += pass 1         memory: += pass 2
        │                        │                        │
        ▼                        ▼                        ▼
   errors = [HIGH]           errors = [MEDIUM]        errors = [LOW]
        │                        │                        │
        ▼                        ▼                        ▼
-  halt_prob = 0.2           halt_prob = 0.3          halt_prob = 0.5
-  (not confident)           (getting there)          (confident!)
+  halt = 0.2               halt = 0.3               halt = 0.5
+  (not confident)          (getting there)           (confident!)
        │                        │                        │
        ▼                        ▼                        ▼
-  logits × 0.2              logits × 0.3             logits × 0.5
+  logits × 0.2             logits × 0.3              logits × 0.5
        │                        │                        │
-       └────────────┬───────────┘────────────────────────┘
-                    ▼
-           final logits = Σ (halt_prob × step_logits)
-                    ▼
-              next token
+       └───────────┬────────────┘────────────────────────┘
+                   ▼
+          final = Σ (halt_prob × step_logits)
 ```
 
-## Memory Lifecycle
+## Multi-Chunk Training
+
+```
+  Group: 4 consecutive 128-token chunks from same document
+
+  chunk 1: "Alice works at Acme Corp as an engineer..."
+           │
+           ▼
+      forward → loss₁ → backward → detach_state
+      memory: writes 2 vectors (from blocks 23, 24)
+      state:  24 GRU states updated
+           │
+           ▼ (memory + state persist, gradients don't)
+  chunk 2: "She moved to Tokyo last year..."
+           │
+           ▼
+      forward (reads chunk 1's memory!) → loss₂ → backward → detach
+      memory: writes 2 more vectors (now 4 stored)
+           │
+           ▼
+  chunk 3: "Her colleague Bob joined the team..."
+           │
+           ▼
+      forward (reads chunks 1-2 memory) → loss₃ → backward → detach
+      memory: writes 2 more (now 6 stored)
+           │
+           ▼
+  chunk 4: "Where does Alice work?"
+           │
+           ▼
+      forward (reads all 6 memories!) → loss₄ → backward
+      Answer quality depends on memory retrieval
+
+  ─── reset_state() ─── next group ───
+```
+
+## Value / Reward / Goal Flow
+
+```
+                    ┌──────────────┐
+                    │  GOAL STATE   │◄── goal_gru(errors, δ)
+                    │  dim=64       │    slow-updating (sigmoid(3)≈0.95)
+                    │  biases memory│
+                    │  queries      │
+                    └──────┬───────┘
+                           │
+      chunk t-1            │           chunk t
+      ───────              │           ───────
+                           │
+  errors_{t-1} ────────────┼──► errors_t
+       │                   │        │
+       │                   │        ▼
+       │              ┌────┴──────────────┐
+       └─────────────►│  REWARD NETWORK    │
+                      │  [e_{t-1}, e_t]    │
+                      │  → intrinsic reward│
+                      └────────┬───────────┘
+                               │
+    V(s_{t-1}) ◄───  V(s_t) ◄─┤
+    (detached)   │  (in graph) │
+                 │      │      │
+                 │      ▼      ▼
+                 │  ┌──────────────────┐
+                 │  │  VALUE HEAD       │
+                 │  │  errors + states  │
+                 │  │  → scalar value   │
+                 │  │                   │
+                 │  │  trained to       │
+                 │  │  predict -lm_loss │
+                 │  └──────────────────┘
+                 │
+                 ▼
+          TD error: δ = reward + γ·V(t) - V(t-1)
+                 │
+                 ├──► goal_gru update
+                 └──► memory strength update
+```
+
+## Memory Lifecycle Example
 
 ```
   Input 1: "Alice works at Acme Corp as an engineer in Tokyo"
 
-  Block 5: gate=0.82 for "Alice/Acme" positions → WRITE
-  Block 6: gate=0.76 for "engineer/Tokyo" positions → WRITE
+  Block 23: write_scores focus on "Alice/Acme/engineer" → WRITE
+  Block 24: write_scores focus on "Tokyo" → WRITE
 
-  Memory: [Alice-Acme(0.82), engineer-Tokyo(0.76), ...]
-
-  ─────────────────────────────────────────────────
-
-  Input 2: "Alice works at Acme Corp as an engineer in Tokyo"  (repeated)
-
-  Block 5: mem_read ≈ hidden → novelty ≈ 0 → gate=0.08 → SKIP
-  Block 6: mem_read ≈ hidden → novelty ≈ 0 → gate=0.05 → SKIP
-
-  Memory: unchanged (no duplicates stored)
+  Memory: [Alice-Acme-eng(0.52), Tokyo(0.48), ...]
 
   ─────────────────────────────────────────────────
 
-  Input 3: "Bob joined Globex as a designer in Paris"
+  Input 2 (same group): "She also volunteers at a local school"
 
-  Block 5: mem_read ≠ hidden → novelty HIGH → gate=0.79 → WRITE
-  Block 6: mem_read ≠ hidden → novelty HIGH → gate=0.71 → WRITE
+  Block 23: write_scores focus on "volunteers/school" → WRITE
+  Block 24: write_scores neutral → WEAK WRITE
 
-  Memory: [Alice-Acme(0.82), engineer-Tokyo(0.76),
-           Bob-Globex(0.79), designer-Paris(0.71), ...]
+  Memory: [Alice-Acme-eng(0.52), Tokyo(0.48),
+           volunteers-school(0.45), weak(0.31), ...]
 
   ─────────────────────────────────────────────────
 
-  Input 4: "Where does Alice work?"
+  Input 3 (same group): "What company does Alice work for?"
 
-  All blocks: Memory-Attention retrieves Alice-Acme slot
-  Input-aware gate: question + relevant memory → OPEN
+  All blocks: Memory attention retrieves Alice-Acme-eng slot
+  Goal state: biases queries toward person/company info
+  Memory gate: question + relevant memory → OPEN
   Model generates: "Acme Corp"
-```
 
-## Brain Analogy Map
-
-```
-  ┌──────────────────────┬──────────────────────────────────┐
-  │  Brain               │  Predictive Transformer           │
-  ├──────────────────────┼──────────────────────────────────┤
-  │  Cortical column     │  PredictiveBlock                  │
-  │  Feedforward path    │  Self-Attention + FFN              │
-  │  Feedback path       │  Prediction Head (top-down)       │
-  │  Prediction error    │  ‖actual - predicted‖             │
-  │  Neural settling     │  Adaptive settling loop           │
-  │  Working memory (PFC)│  GRU state (per block)            │
-  │  Hippocampus         │  Shared Memory Bank               │
-  │  Encoding gate       │  Novelty-aware write gate         │
-  │  Pattern completion  │  Memory attention (retrieval)     │
-  │  Novelty detection   │  hidden - mem_read signal         │
-  │  Consolidation       │  Strength-based eviction          │
-  │  Attention (top-down)│  Input-aware memory gate          │
-  │  Neuromodulation     │  Learned gates (context-dependent)│
-  └──────────────────────┴──────────────────────────────────┘
+  TD update: correct → δ positive → strengthen retrieved slots
 ```
