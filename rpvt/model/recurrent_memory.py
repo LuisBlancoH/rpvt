@@ -363,6 +363,37 @@ class RecurrentMemoryTransformer(nn.Module):
 
     def reset_memory(self):
         self.memory_buffer.reset()
+        self._usage_accumulator = None
+
+    def _update_priorities_from_usage(self):
+        """Update memory priorities based on retrieval attention.
+
+        Entries the model attends to get refreshed priority.
+        Entries the model ignores keep stale priority.
+        Over time, unused entries get evicted by fresher ones.
+        No prescribed decay — driven by the model's own attention.
+        """
+        if self._usage_accumulator is None:
+            return
+        if self.memory_buffer.n_stored == 0:
+            return
+
+        n = self.memory_buffer.n_stored
+        usage = self._usage_accumulator[:n]
+
+        # Normalize usage to [0, 1]
+        if usage.max() > 0:
+            usage_norm = usage / usage.max()
+        else:
+            usage_norm = usage
+
+        # Blend: priority = max(current_priority, usage)
+        # Used entries get refreshed. Unused entries stay stale.
+        current = self.memory_buffer.priorities[:n]
+        self.memory_buffer.priorities[:n] = torch.max(current, usage_norm)
+
+        # Reset accumulator for next chunk
+        self._usage_accumulator = None
 
     def _forward_with_memory(self, input_ids, memory=None):
         """Run Qwen layers with memory + value token.
@@ -400,18 +431,30 @@ class RecurrentMemoryTransformer(nn.Module):
                 n_mem = memory.shape[0]
                 nh = self._mem_heads
                 hd = self._mem_head_dim
-                cur_len = x.shape[1]  # seq_len+1 (includes value token)
+                cur_len = x.shape[1]
 
                 q = attn['q'](x).view(batch_size, cur_len, nh, hd).transpose(1, 2)
                 mem = memory.unsqueeze(0).expand(batch_size, -1, -1)
                 k = attn['k'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
                 v = attn['v'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
 
-                out = F.scaled_dot_product_attention(q, k, v)
+                # Compute attention weights explicitly for priority tracking
+                scale = hd ** -0.5
+                attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+                attn_weights = torch.softmax(attn_weights, dim=-1)
+                out = torch.matmul(attn_weights, v)
+
                 out = out.transpose(1, 2).contiguous().view(batch_size, cur_len, -1)
                 out = attn['o'](out)
-
                 x = x + gate * out
+
+                # Track per-entry usage (mean attention across heads and positions)
+                entry_usage = attn_weights.mean(dim=(0, 1, 2)).detach()  # (n_mem,)
+                if self._usage_accumulator is None or self._usage_accumulator.shape[0] != n_mem:
+                    self._usage_accumulator = torch.zeros(n_mem, device=x.device)
+                else:
+                    self._usage_accumulator = self._usage_accumulator.to(device=x.device)
+                self._usage_accumulator += entry_usage
 
         # Split: control tokens + normal output
         value_hidden = x[:, 0, :]       # (batch, hidden) — deep value state
@@ -517,10 +560,10 @@ class RecurrentMemoryTransformer(nn.Module):
         if use_adaptive and halt_budget > 0.01:
             accumulated_logits = accumulated_logits + halt_budget * step_logits.float()
 
+        # Update existing memory priorities based on retrieval usage
+        self._update_priorities_from_usage()
+
         # Store final extraction in persistent buffer
-        # Control states (value/confidence) only visible during settling,
-        # not persisted. If the model needs meta-info across chunks,
-        # it can learn to encode it in the 16 extraction queries.
         if current_extraction is not None:
             final_memory, final_priority, _ = current_extraction
             self.memory_buffer.store(final_memory, final_priority)
