@@ -352,21 +352,39 @@ class RecurrentMemoryTransformer(nn.Module):
         # Ensure memory buffer is on correct device
         self.memory_buffer.to(device=device)
 
-        # Read memory
-        memory = self.memory_buffer.read()
+        # Read persistent memory (from previous chunks)
+        persistent_memory = self.memory_buffer.read()
 
         # Settling loop
+        # During settling: temporary extraction (overwritten each pass)
+        # After settling: only final extraction stored persistently
         halt_budget = 1.0
         accumulated_logits = None
         actual_passes = 0
         all_confidences = []
+        current_extraction = None  # temporary, refined each pass
 
         for pass_idx in range(max_steps):
-            # Forward through Qwen with memory
-            hidden = self._forward_with_memory(input_ids, memory)
+            # Combine persistent memory + current extraction for this pass
+            if current_extraction is not None and persistent_memory is not None:
+                ext = current_extraction[0].detach()
+                if ext.dim() == 3:
+                    ext = ext.squeeze(0)  # (batch, K, hidden) → (K, hidden)
+                visible_memory = torch.cat([persistent_memory, ext], dim=0)
+            elif current_extraction is not None:
+                ext = current_extraction[0].detach()
+                if ext.dim() == 3:
+                    ext = ext.squeeze(0)
+                visible_memory = ext
+            else:
+                visible_memory = persistent_memory  # None or (n, hidden)
 
-            # Extract new memory + priority + confidence
+            # Forward through Qwen with visible memory
+            hidden = self._forward_with_memory(input_ids, visible_memory)
+
+            # Extract (overwrites previous extraction — settling refines)
             extracted_memory, priority, confidence = self.extractor(hidden)
+            current_extraction = (extracted_memory, priority)
 
             actual_passes += 1
 
@@ -374,7 +392,6 @@ class RecurrentMemoryTransformer(nn.Module):
             step_logits = self.lm_head(self.norm(hidden))
 
             if use_adaptive:
-                # Confidence-weighted accumulation
                 conf = torch.min(confidence.float(),
                     torch.tensor(halt_budget, device=device, dtype=torch.float32))
                 all_confidences.append(conf.item())
@@ -385,21 +402,19 @@ class RecurrentMemoryTransformer(nn.Module):
                     accumulated_logits = accumulated_logits + conf * step_logits.float()
 
                 halt_budget -= conf.item()
-
-                # Update memory for next pass
-                self.memory_buffer.store(extracted_memory, priority)
-                memory = self.memory_buffer.read()
-
                 if halt_budget < 0.01:
                     break
             else:
                 accumulated_logits = step_logits
-                # Store memory
-                self.memory_buffer.store(extracted_memory, priority)
 
         # Distribute remaining budget
         if use_adaptive and halt_budget > 0.01:
             accumulated_logits = accumulated_logits + halt_budget * step_logits.float()
+
+        # Store ONLY the final extraction in persistent buffer
+        if current_extraction is not None:
+            final_memory, final_priority = current_extraction
+            self.memory_buffer.store(final_memory, final_priority)
 
         logits = accumulated_logits
 
