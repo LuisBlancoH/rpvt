@@ -316,11 +316,14 @@ class RecurrentMemoryTransformer(nn.Module):
         ])
 
         # Control tokens: processed through all 24 layers alongside input
-        # Both attend to input + memory, building deep understanding before deciding
+        # All attend to input + memory, building deep understanding before deciding
         self.value_token = nn.Parameter(
             torch.randn(1, config.hidden_size) * 0.02
         )
         self.confidence_token = nn.Parameter(
+            torch.randn(1, config.hidden_size) * 0.02
+        )
+        self.manager_token = nn.Parameter(
             torch.randn(1, config.hidden_size) * 0.02
         )
 
@@ -339,13 +342,22 @@ class RecurrentMemoryTransformer(nn.Module):
         self.confidence_proj = nn.Linear(config.hidden_size, 1, bias=True)
         nn.init.constant_(self.confidence_proj.bias, 1.0)  # biased toward halting
 
+        # Memory manager: scores each entry's relevance given current context
+        # manager_hidden (deep context) → project to scoring space
+        # Then dot product with each memory entry → per-entry priority
+        self.manager_key_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.manager_query_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
         # Cast new modules to bf16
         self.extractor.to(dtype=torch.bfloat16)
         self.mem_attns.to(dtype=torch.bfloat16)
         self.value_token.data = self.value_token.data.to(dtype=torch.bfloat16)
         self.confidence_token.data = self.confidence_token.data.to(dtype=torch.bfloat16)
+        self.manager_token.data = self.manager_token.data.to(dtype=torch.bfloat16)
         self.value_mlp.to(dtype=torch.bfloat16)
         self.confidence_proj.to(dtype=torch.bfloat16)
+        self.manager_key_proj.to(dtype=torch.bfloat16)
+        self.manager_query_proj.to(dtype=torch.bfloat16)
 
         # Memory buffer
         self.memory_buffer = MemoryBuffer(
@@ -363,37 +375,6 @@ class RecurrentMemoryTransformer(nn.Module):
 
     def reset_memory(self):
         self.memory_buffer.reset()
-        self._usage_accumulator = None
-
-    def _update_priorities_from_usage(self):
-        """Update memory priorities based on retrieval attention.
-
-        Entries the model attends to get refreshed priority.
-        Entries the model ignores keep stale priority.
-        Over time, unused entries get evicted by fresher ones.
-        No prescribed decay — driven by the model's own attention.
-        """
-        if self._usage_accumulator is None:
-            return
-        if self.memory_buffer.n_stored == 0:
-            return
-
-        n = self.memory_buffer.n_stored
-        usage = self._usage_accumulator[:n]
-
-        # Normalize usage to [0, 1]
-        if usage.max() > 0:
-            usage_norm = usage / usage.max()
-        else:
-            usage_norm = usage
-
-        # Blend: priority = max(current_priority, usage)
-        # Used entries get refreshed. Unused entries stay stale.
-        current = self.memory_buffer.priorities[:n]
-        self.memory_buffer.priorities[:n] = torch.max(current, usage_norm)
-
-        # Reset accumulator for next chunk
-        self._usage_accumulator = None
 
     def _forward_with_memory(self, input_ids, memory=None):
         """Run Qwen layers with memory + value token.
@@ -408,13 +389,14 @@ class RecurrentMemoryTransformer(nn.Module):
 
         x = self.embed_tokens(input_ids)
 
-        # Prepend control tokens: [value, confidence, input...]
+        # Prepend control tokens: [value, confidence, manager, input...]
         vt = self.value_token.unsqueeze(0).expand(batch_size, -1, -1)
         ct = self.confidence_token.unsqueeze(0).expand(batch_size, -1, -1)
-        x = torch.cat([vt, ct, x], dim=1)  # (batch, 2+seq_len, hidden)
+        mt = self.manager_token.unsqueeze(0).expand(batch_size, -1, -1)
+        x = torch.cat([vt, ct, mt, x], dim=1)  # (batch, 3+seq_len, hidden)
 
-        # Position IDs: control tokens get 0,1, input starts at 2
-        position_ids = torch.arange(seq_len + 2, device=device).unsqueeze(0)
+        # Position IDs: control tokens get 0,1,2, input starts at 3
+        position_ids = torch.arange(seq_len + 3, device=device).unsqueeze(0)
         position_embeddings = self.rotary_emb(x, position_ids)
 
         for i, layer in enumerate(self.layers):
@@ -438,29 +420,19 @@ class RecurrentMemoryTransformer(nn.Module):
                 k = attn['k'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
                 v = attn['v'](mem).view(batch_size, n_mem, nh, hd).transpose(1, 2)
 
-                # Compute attention weights explicitly for priority tracking
-                scale = hd ** -0.5
-                attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-                attn_weights = torch.softmax(attn_weights, dim=-1)
-                out = torch.matmul(attn_weights, v)
+                out = F.scaled_dot_product_attention(q, k, v)
 
                 out = out.transpose(1, 2).contiguous().view(batch_size, cur_len, -1)
                 out = attn['o'](out)
                 x = x + gate * out
 
-                # Track per-entry usage (mean attention across heads and positions)
-                entry_usage = attn_weights.mean(dim=(0, 1, 2)).detach()  # (n_mem,)
-                if self._usage_accumulator is None or self._usage_accumulator.shape[0] != n_mem:
-                    self._usage_accumulator = torch.zeros(n_mem, device=x.device)
-                else:
-                    self._usage_accumulator = self._usage_accumulator.to(device=x.device)
-                self._usage_accumulator += entry_usage
 
         # Split: control tokens + normal output
         value_hidden = x[:, 0, :]       # (batch, hidden) — deep value state
         confidence_hidden = x[:, 1, :]  # (batch, hidden) — deep confidence state
-        output = x[:, 2:, :]           # (batch, seq_len, hidden) — normal output
-        return output, value_hidden, confidence_hidden
+        manager_hidden = x[:, 2, :]     # (batch, hidden) — deep memory management
+        output = x[:, 3:, :]           # (batch, seq_len, hidden) — normal output
+        return output, value_hidden, confidence_hidden, manager_hidden
 
     def forward(self, input_ids, labels=None, n_passes=None,
                 return_info=False):
@@ -514,10 +486,9 @@ class RecurrentMemoryTransformer(nn.Module):
             else:
                 visible_memory = persistent_memory  # None or (n, hidden)
 
-            # Forward through Qwen (value + confidence tokens process alongside)
-            hidden, value_hidden, confidence_hidden = self._forward_with_memory(
-                input_ids, visible_memory
-            )
+            # Forward through Qwen (control tokens process alongside)
+            hidden, value_hidden, confidence_hidden, manager_hidden = \
+                self._forward_with_memory(input_ids, visible_memory)
 
             # Deep value: value token (state) + last position (action)
             action_hidden = hidden[:, -1, :]
@@ -560,8 +531,23 @@ class RecurrentMemoryTransformer(nn.Module):
         if use_adaptive and halt_budget > 0.01:
             accumulated_logits = accumulated_logits + halt_budget * step_logits.float()
 
-        # Update existing memory priorities based on retrieval usage
-        self._update_priorities_from_usage()
+        # Deep memory management: manager token scores each existing entry
+        if self.memory_buffer.n_stored > 0 and manager_hidden is not None:
+            mem = self.memory_buffer.read()
+            if mem is not None:
+                # Project manager and memory into scoring space
+                q = self.manager_query_proj(manager_hidden.detach())  # (batch, hidden)
+                k = self.manager_key_proj(mem)  # (n_mem, hidden)
+
+                # Per-entry relevance: dot product
+                if q.dim() > 1:
+                    q = q[0]  # take first batch item
+                scores = torch.matmul(k, q) / (self.hidden_size ** 0.5)  # (n_mem,)
+                updated_priorities = torch.sigmoid(scores).detach()
+
+                # Update: model decides each entry's new priority
+                n = self.memory_buffer.n_stored
+                self.memory_buffer.priorities[:n] = updated_priorities[:n].float()
 
         # Store final extraction in persistent buffer
         if current_extraction is not None:
