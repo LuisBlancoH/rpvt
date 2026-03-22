@@ -499,10 +499,18 @@ class RecurrentMemoryTransformer(nn.Module):
         if use_adaptive and halt_budget > 0.01:
             accumulated_logits = accumulated_logits + halt_budget * step_logits.float()
 
-        # Store ONLY the final extraction in persistent buffer
+        # Store final extraction + control states in persistent buffer
         if current_extraction is not None:
-            final_memory, final_priority, _ = current_extraction
+            final_memory, final_priority, final_control = current_extraction
             self.memory_buffer.store(final_memory, final_priority)
+            # Also store value + confidence hidden states (detached)
+            # Next chunk can see "how confident/valuable was I last time?"
+            ctrl = final_control.detach()
+            if ctrl.dim() == 1:
+                ctrl = ctrl.unsqueeze(0)
+            # Store with high priority — control state is always relevant
+            ctrl_priority = torch.ones(ctrl.shape[0], device=ctrl.device) * 0.8
+            self.memory_buffer.store(ctrl, ctrl_priority)
 
         logits = accumulated_logits
 
