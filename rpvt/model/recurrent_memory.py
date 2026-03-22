@@ -297,11 +297,15 @@ class RecurrentMemoryTransformer(nn.Module):
             for _ in range(self.n_layers)
         ])
 
-        # Value token: processed through all 24 layers alongside input
-        # Gets deep understanding of state + memory before value estimation
+        # Control tokens: processed through all 24 layers alongside input
+        # Both attend to input + memory, building deep understanding before deciding
         self.value_token = nn.Parameter(
             torch.randn(1, config.hidden_size) * 0.02
         )
+        self.confidence_token = nn.Parameter(
+            torch.randn(1, config.hidden_size) * 0.02
+        )
+
         # Deep value MLP: value_token_hidden (state) + last_pos (action) → scalar
         self.value_mlp = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size, bias=True),
@@ -313,11 +317,17 @@ class RecurrentMemoryTransformer(nn.Module):
         nn.init.zeros_(self.value_mlp[-1].weight)
         nn.init.zeros_(self.value_mlp[-1].bias)
 
+        # Confidence projection: confidence_token_hidden → halt probability
+        self.confidence_proj = nn.Linear(config.hidden_size, 1, bias=True)
+        nn.init.constant_(self.confidence_proj.bias, 1.0)  # biased toward halting
+
         # Cast new modules to bf16
         self.extractor.to(dtype=torch.bfloat16)
         self.mem_attns.to(dtype=torch.bfloat16)
         self.value_token.data = self.value_token.data.to(dtype=torch.bfloat16)
+        self.confidence_token.data = self.confidence_token.data.to(dtype=torch.bfloat16)
         self.value_mlp.to(dtype=torch.bfloat16)
+        self.confidence_proj.to(dtype=torch.bfloat16)
 
         # Memory buffer
         self.memory_buffer = MemoryBuffer(
@@ -349,12 +359,13 @@ class RecurrentMemoryTransformer(nn.Module):
 
         x = self.embed_tokens(input_ids)
 
-        # Prepend value token
-        vt = self.value_token.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, hidden)
-        x = torch.cat([vt, x], dim=1)  # (batch, 1+seq_len, hidden)
+        # Prepend control tokens: [value, confidence, input...]
+        vt = self.value_token.unsqueeze(0).expand(batch_size, -1, -1)
+        ct = self.confidence_token.unsqueeze(0).expand(batch_size, -1, -1)
+        x = torch.cat([vt, ct, x], dim=1)  # (batch, 2+seq_len, hidden)
 
-        # Position IDs: value token gets position 0, input starts at 1
-        position_ids = torch.arange(seq_len + 1, device=device).unsqueeze(0)
+        # Position IDs: control tokens get 0,1, input starts at 2
+        position_ids = torch.arange(seq_len + 2, device=device).unsqueeze(0)
         position_embeddings = self.rotary_emb(x, position_ids)
 
         for i, layer in enumerate(self.layers):
@@ -384,10 +395,11 @@ class RecurrentMemoryTransformer(nn.Module):
 
                 x = x + gate * out
 
-        # Split: value token hidden state + rest
-        value_hidden = x[:, 0, :]      # (batch, hidden) — deep value state
-        output = x[:, 1:, :]           # (batch, seq_len, hidden) — normal output
-        return output, value_hidden
+        # Split: control tokens + normal output
+        value_hidden = x[:, 0, :]       # (batch, hidden) — deep value state
+        confidence_hidden = x[:, 1, :]  # (batch, hidden) — deep confidence state
+        output = x[:, 2:, :]           # (batch, seq_len, hidden) — normal output
+        return output, value_hidden, confidence_hidden
 
     def forward(self, input_ids, labels=None, n_passes=None,
                 return_info=False):
@@ -425,34 +437,42 @@ class RecurrentMemoryTransformer(nn.Module):
                 ext = current_extraction[0].detach()
                 if ext.dim() == 3:
                     ext = ext.squeeze(0)
-                # Include value token hidden state so model can see its own value
-                val_vec = current_extraction[2].detach()  # value token hidden (hidden_size)
-                if val_vec.dim() == 1:
-                    val_vec = val_vec.unsqueeze(0)  # (1, hidden)
-                visible_memory = torch.cat([persistent_memory, ext, val_vec], dim=0)
+                # Include control token states (value + confidence)
+                ctrl = current_extraction[2].detach()  # (2, hidden)
+                if ctrl.dim() == 1:
+                    ctrl = ctrl.unsqueeze(0)
+                visible_memory = torch.cat([persistent_memory, ext, ctrl], dim=0)
             elif current_extraction is not None:
                 ext = current_extraction[0].detach()
                 if ext.dim() == 3:
                     ext = ext.squeeze(0)
-                val_vec = current_extraction[2].detach()
-                if val_vec.dim() == 1:
-                    val_vec = val_vec.unsqueeze(0)
-                visible_memory = torch.cat([ext, val_vec], dim=0)
+                ctrl = current_extraction[2].detach()
+                if ctrl.dim() == 1:
+                    ctrl = ctrl.unsqueeze(0)
+                visible_memory = torch.cat([ext, ctrl], dim=0)
             else:
                 visible_memory = persistent_memory  # None or (n, hidden)
 
-            # Forward through Qwen with visible memory (value token processed alongside)
-            hidden, value_hidden = self._forward_with_memory(input_ids, visible_memory)
+            # Forward through Qwen (value + confidence tokens process alongside)
+            hidden, value_hidden, confidence_hidden = self._forward_with_memory(
+                input_ids, visible_memory
+            )
 
-            # Compute value: value token (deep state) + last position (action)
+            # Deep value: value token (state) + last position (action)
             action_hidden = hidden[:, -1, :]
             value_input = torch.cat([value_hidden, action_hidden], dim=-1)
             value = self.value_mlp(value_input).squeeze(-1)
 
-            # Extract memory + priority + confidence
-            extracted_memory, priority, confidence, _, value_vec = self.extractor(hidden)
-            # Store value_vec from value token (richer than extraction query)
-            current_extraction = (extracted_memory, priority, value_hidden)
+            # Deep confidence: from confidence token (24 layers deep)
+            confidence = torch.sigmoid(self.confidence_proj(confidence_hidden)).squeeze(-1)
+
+            # Extract memory + priority (confidence/value now from deep tokens)
+            extracted_memory, priority, _, _, _ = self.extractor(hidden)
+            # Store value + confidence hidden states for next pass visibility
+            control_hidden = torch.stack([value_hidden, confidence_hidden], dim=1)
+            if control_hidden.dim() == 3:
+                control_hidden = control_hidden.squeeze(0)  # (2, hidden)
+            current_extraction = (extracted_memory, priority, control_hidden)
 
             actual_passes += 1
 
