@@ -265,19 +265,20 @@ class RecurrentMemoryTransformer(nn.Module):
                             if p.requires_grad)
             print(f"  LoRA: rank={lora_rank}, params={lora_params/1e6:.2f}M")
 
-        # Store Qwen components
-        base = qwen_model.model if not hasattr(qwen_model, 'base_model') else qwen_model.base_model.model.model
+        # Store Qwen components (handle both LoRA-wrapped and plain models)
         self.qwen = qwen_model
+        if hasattr(qwen_model, 'base_model'):
+            # LoRA-wrapped: base_model.model.model is the Qwen2Model
+            base = qwen_model.base_model.model.model
+            self.lm_head = qwen_model.base_model.model.lm_head
+        else:
+            # Plain model: model is the Qwen2Model
+            base = qwen_model.model
+            self.lm_head = qwen_model.lm_head
         self.embed_tokens = base.embed_tokens
         self.norm = base.norm
         self.rotary_emb = base.rotary_emb
         self.layers = base.layers
-
-        # LM head
-        if hasattr(qwen_model, 'base_model'):
-            self.lm_head = qwen_model.base_model.model.lm_head
-        else:
-            self.lm_head = qwen_model.lm_head
 
         # Memory extraction
         self.extractor = MemoryExtractor(
