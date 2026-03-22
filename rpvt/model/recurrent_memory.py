@@ -267,12 +267,13 @@ class RecurrentMemoryTransformer(nn.Module):
 
         # Store Qwen components (handle both LoRA-wrapped and plain models)
         self.qwen = qwen_model
-        if hasattr(qwen_model, 'base_model'):
+        is_peft = hasattr(qwen_model, 'peft_config')
+        if is_peft:
             # LoRA-wrapped: base_model.model.model is the Qwen2Model
             base = qwen_model.base_model.model.model
             self.lm_head = qwen_model.base_model.model.lm_head
         else:
-            # Plain model: model is the Qwen2Model
+            # Plain model: .model is the Qwen2Model
             base = qwen_model.model
             self.lm_head = qwen_model.lm_head
         self.embed_tokens = base.embed_tokens
