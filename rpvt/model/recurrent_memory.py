@@ -136,10 +136,11 @@ class MemoryExtractor(nn.Module):
 
 
 class MemoryBuffer:
-    """Memory buffer with learned priority-based eviction.
+    """Memory buffer with learned priority-based eviction + temporal encoding.
 
-    When space available: append (fast, like FIFO).
-    When full: replace lowest-priority entries (learned eviction).
+    Each stored vector gets a sinusoidal step embedding added to it.
+    This gives the model temporal awareness — it can distinguish
+    "A then B" from "B then A" through the step signal.
     """
 
     def __init__(self, max_entries, hidden_size, device='cpu', dtype=torch.bfloat16):
@@ -149,11 +150,25 @@ class MemoryBuffer:
                                    device=device, dtype=dtype)
         self.priorities = torch.zeros(max_entries, device=device, dtype=torch.float32)
         self.n_stored = 0
+        self.step_counter = 0
+
+        # Precompute frequency bands for sinusoidal step encoding
+        pos = torch.arange(hidden_size // 2, dtype=torch.float32)
+        self.register_freqs = 1.0 / (10000 ** (pos / (hidden_size // 2)))
+
+    def _step_signal(self, step, device, dtype):
+        """Sinusoidal temporal encoding. No learned params, generalizes to any step."""
+        freqs = self.register_freqs.to(device)
+        signal = torch.zeros(self.hidden_size, device=device, dtype=dtype)
+        signal[0::2] = torch.sin(step * freqs)
+        signal[1::2] = torch.cos(step * freqs)
+        return signal * 0.1  # small scale — additive, doesn't dominate content
 
     def reset(self):
         self.entries.zero_()
         self.priorities.zero_()
         self.n_stored = 0
+        self.step_counter = 0
 
     def read(self):
         if self.n_stored == 0:
@@ -180,13 +195,16 @@ class MemoryBuffer:
         pris = priorities.detach().float() if priorities is not None \
                else torch.full((K,), 0.5, device=vecs.device)
 
+        # Add temporal signal — the model can distinguish ordering
+        step_signal = self._step_signal(self.step_counter, vecs.device, vecs.dtype)
+        vecs = vecs + step_signal.unsqueeze(0)  # same step for all vectors in this batch
+        self.step_counter += 1
+
         if self.n_stored + K <= self.max_entries:
-            # Space available — just append
             self.entries[self.n_stored:self.n_stored + K] = vecs
             self.priorities[self.n_stored:self.n_stored + K] = pris
             self.n_stored += K
         else:
-            # Full — replace lowest-priority entries
             for i in range(K):
                 if self.n_stored < self.max_entries:
                     idx = self.n_stored
@@ -194,7 +212,7 @@ class MemoryBuffer:
                 else:
                     idx = self.priorities[:self.n_stored].argmin().item()
                     if pris[i] <= self.priorities[idx]:
-                        continue  # not important enough to evict
+                        continue
                 self.entries[idx] = vecs[i]
                 self.priorities[idx] = pris[i]
 
