@@ -72,10 +72,18 @@ class MemoryExtractor(nn.Module):
         self.halt_proj = nn.Linear(hidden_size, 1, bias=True)
         nn.init.constant_(self.halt_proj.bias, 1.0)  # start biased toward stopping
 
-        # Value: predict expected future reward from current state
-        self.value_proj = nn.Linear(hidden_size, 1, bias=True)
-        nn.init.zeros_(self.value_proj.weight)
-        nn.init.zeros_(self.value_proj.bias)
+        # Value: deep network that sees state (value query) + action context (pooled hidden)
+        # Computes value from BOTH what I know AND what I'm about to do
+        self.value_net = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size, bias=True),  # state + action
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size // 4, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 4, 1, bias=True),
+        )
+        # Zero-init final layer so value starts at 0
+        nn.init.zeros_(self.value_net[-1].weight)
+        nn.init.zeros_(self.value_net[-1].bias)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -118,8 +126,10 @@ class MemoryExtractor(nn.Module):
         # Confidence (halt)
         confidence = torch.sigmoid(self.halt_proj(confidence_vec)).squeeze(-1)
 
-        # Value (expected future reward)
-        value = self.value_proj(value_vec).squeeze(-1)  # unbounded scalar
+        # Value: deep computation from state (value query) + action (pooled hidden)
+        action_context = hidden_states.mean(dim=1)  # (batch, hidden) — what model will do
+        value_input = torch.cat([value_vec, action_context], dim=-1)  # (batch, hidden*2)
+        value = self.value_net(value_input).squeeze(-1)  # scalar
 
         return memory, priority, confidence, value, value_vec
 
@@ -289,6 +299,7 @@ class RecurrentMemoryTransformer(nn.Module):
         # Cast new modules to bf16
         self.extractor.to(dtype=torch.bfloat16)
         self.mem_attns.to(dtype=torch.bfloat16)
+        # Note: value_net is inside extractor, already cast
 
         # Memory buffer
         self.memory_buffer = MemoryBuffer(
