@@ -126,8 +126,9 @@ class MemoryExtractor(nn.Module):
         # Confidence (halt)
         confidence = torch.sigmoid(self.halt_proj(confidence_vec)).squeeze(-1)
 
-        # Value: deep computation from state (value query) + action (pooled hidden)
-        action_context = hidden_states.mean(dim=1)  # (batch, hidden) — what model will do
+        # Value: deep computation from state (value query) + action (last position)
+        # Last position's hidden state is what determines the next token
+        action_context = hidden_states[:, -1, :]  # (batch, hidden) — what model will generate
         value_input = torch.cat([value_vec, action_context], dim=-1)  # (batch, hidden*2)
         value = self.value_net(value_input).squeeze(-1)  # scalar
 
